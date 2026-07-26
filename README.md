@@ -1,62 +1,82 @@
-# emby-cache-tool
+# emby-archiver
 
-> **项目已更名为 [emby-archiver](https://github.com/你的用户名/emby-archiver)**，本仓库仍保留原名以便兼容。
+> A Python tool to archive Emby videos offline for Windows, Linux, Termux — with CLI, GUI and Web interfaces.
+>
+> 把 Emby 资源离线归档到本地的 Python 工具 —— 支持 Windows、Linux、Termux，提供 CLI、GUI 和 Web 三种入口。
 
 ---
 
-# emby-archiver
+## Description / 项目描述
 
-一个可在 Windows、本地终端、Termux / 无图形环境下使用的 Python 工具，用 Emby 账号登录服务器，把能访问的视频离线归档到本地。
+### English
 
-## 关于 emby-archiver
+**emby-archiver** is a lightweight Python downloader that logs into your Emby server and saves the media you can access to local storage for offline viewing. It is **not** a media player, not a streaming client, and not a "watch-while-downloading" buffer — it is purely an offline archiving tool.
 
-如果你有一个 Emby 媒体服务器的账号，想把自己能访问的电影、剧集下载到本地离线观看——不管是笔记本、小主机、还是挂着 Termux 的手机——这个工具就是为你做的。
+Three entry points make it run anywhere:
+- **CLI** — for terminal power users and scripting
+- **GUI** (Tkinter) — for a familiar desktop experience
+- **Web** (Starlette + uvicorn) — for headless boxes, remote access, phone or Termux browsers
 
-它不是 Emby 客户端，不是在线播放器，也不是边播边缓存的流媒体工具。它的定位很明确：**一个把 Emby 资源离线归档到本地的下载器**。
+Default `auto` mode picks the right one: GUI when a desktop is available, Web when not.
 
-### 为什么会有这个项目
+Key design choices:
+- Multi-threaded segmented downloading with automatic single-thread fallback when the server doesn't support `Range`
+- `.part`-based pause/resume so downloads survive network flake
+- SQLite-backed record tracking so completed items are never re-downloaded
+- Works around the no-`DownloadContent` reality by falling back to `Videos/stream` candidates
+- Optional experimental force-multipart probing for stubborn servers
 
-很多 Emby 用户会遇到这些场景：
+### 中文
 
-- 家里的 Emby 服务器资源不错，但网络不稳定，想下载到笔记本离线看
-- 共享账号的服务器随时可能关停，想趁能访问时把想看的存下来
-- 想在无图形环境的服务器 / VPS / NAS / Termux 上也能跑一个下载工具
-- Web 端的 Emby 虽然能在线播放，但很多浏览器不支持特殊编码，离线转存更省事
-- 账号没有 `DownloadContent` 权限，`Items/{id}/Download` 返回 403，需要绕道 `Videos/stream` 自己处理下载链路
+**emby-archiver** 是一个轻量级 Python 下载器，登录你的 Emby 服务器，把能访问的媒体资源离线保存到本地观看。它**不是**播放器、不是流媒体客户端、也不是"边下边播"的缓冲工具——它纯粹是一个离线归档工具。
 
-现有的 Emby 客户端大多偏播放，缺少一个**纯粹的离线归档工具**。这个项目就是来填这个空白的。
-
-### 三条入口，随处可用
-
-| 入口 | 文件 | 适合场景 |
-|------|------|----------|
-| CLI | `main.py` | 终端操作、脚本调用、自动化 |
-| GUI | `gui.py` | 桌面场景，像正常使用软件一样下载 |
-| Web | `webapp.py` | 无图形环境、远程访问、手机/Termux 浏览器 |
+三条入口让它随处可用：
+- **CLI** — 终端重度玩家和脚本调用
+- **GUI**（Tkinter）— 熟悉的桌面软件体验
+- **Web**（Starlette + uvicorn）— 无图形环境、远程访问、手机或 Termux 浏览器
 
 默认 `auto` 模式自动选择：有桌面走 GUI，没桌面走 Web。
 
-### 核心特点
+核心设计：
+- 多线程分段下载，服务端不支持 `Range` 时自动回退单线程
+- 基于 `.part` 的暂停/续传，网络抖动后还能接着下
+- SQLite 记录追踪，已完成项永不重复下载
+- 针对无 `DownloadContent` 权限的现实，走 `Videos/stream` 候选链路
+- 可选的实验性强制分段探测，对付顽固服务端
 
-- **分段并发下载**：支持多线程分段，不支持 Range 的服务端自动回退单线程
-- **断点续传**：`.part` 临时文件随时可中断、可续传，不用担心网络抖动
-- **SQLite 记录**：下载历史持久化，已完成的自动跳过不会重复下
-- **现实约束优先**：针对无 `DownloadContent` 权限的账号，走 `Videos/stream` 候选链路
-- **可选实验性分段**：对不支持标准 Range 的服务端，可强制试探真实分段
-- **代理支持**：HTTP/HTTPS 代理复用，适合需要走代理链路的场景
-- **Web 完整日志**：历史日志文件切换、级别过滤、关键词搜索、行号显示
+---
 
-### 当前限制
+## About emby-archiver / 关于
 
-- 没有实现 HLS 分片合并，部分特殊资源可能无法离线
-- Web 端按远程场景做了降级，不在浏览器里调用本地播放器
-- 没有做账号认证，局域网使用需注意安全
+### English
 
-### 适用人群
+If you have an Emby server account and want to save the movies and shows you can access — whether on a laptop, a small NAS box, or a phone running Termux — this tool is for you.
 
-- 有 Emby 共享账号、想离线归档资源的用户
-- 在无图形环境（NAS、小主机、Termux）上跑下载工具的用户
-- 需要一个纯粹下载工具、而不是又一个播放器的用户
+It was born from a few real needs:
+
+- Your home Emby server has great content but spotty internet; download once, watch anywhere offline
+- Shared-accounts can disappear anytime; archive while you still can
+- You want a downloader on a headless VPS/NAS/Termux box with no GUI
+- Emby's web player doesn't support every codec; offline transcode is more reliable
+- Your account lacks `DownloadContent` permission, so `Items/{id}/Download` returns 403 — you need to roll your own via `Videos/stream`
+
+Most existing Emby clients focus on playback. There was a gap for a **pure offline archiving tool**. emby-archiver fills that gap.
+
+### 中文
+
+如果你有一个 Emby 服务器账号，想把能访问的电影和剧集保存下来——无论是笔记本、NAS 小主机、还是跑着 Termux 的手机——这就是为你做的工具。
+
+它来自这些真实需求：
+
+- 家里 Emby 服务器资源不错，但网络不稳定，想下载一次随时离线看
+- 共享账号随时可能关停，趁能访问时赶紧存下来
+- 想在无图形环境的服务器 / NAS / Termux 上也能跑下载工具
+- Emby Web 播放器不支持所有编码，离线转存更靠谱
+- 账号没有 `DownloadContent` 权限，`Items/{id}/Download` 返回 403，需要绕道 `Videos/stream` 自己处理下载链路
+
+现有 Emby 客户端大多偏播放，**纯粹的离线归档工具**是空白。emby-archiver 就是来填这个空白的。
+
+---
 
 ## 预览
 
@@ -289,7 +309,7 @@ Web 支持：测试登录、搜索资源、发起下载、单次指定下载目�
 ## 项目结构
 
 ```
-emby-cache-tool/
+emby-archiver/
 ├── app.py              # 统一启动入口
 ├── app_service.py      # 统一业务层
 ├── webapp.py           # Web 应用（Starlette）
