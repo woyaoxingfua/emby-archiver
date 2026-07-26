@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境
+venv/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 配置文件（含明文密码，不要提交到公开仓库）
+config.json
+
+# 临时文件
+tmp/
+tmp_test/
+*.tmp
+
+# 日志
+logs/
+*.log
+
+# 下载目录
+downloads/
+*.part
+*.part.seg*
+
+# 数据库
+store/
+*.db
+*.db-journal
+
+# Playwright
+.playwright-cli/
+
+# WorkBuddy
+.workbuddy/
+
+# OS
+.DS_Store
+Thumbs.db

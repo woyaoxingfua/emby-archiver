@@ -1,0 +1,22 @@
+{
+  "server_url": "https://your-emby-server.example.com",
+  "username": "your_username",
+  "password": "your_password",
+  "api_key": "",
+  "access_token": "",
+  "user_id": "",
+  "download_dir": "downloads",
+  "database_path": "store/cache.db",
+  "device_name": "emby-cache-tool",
+  "user_agent": "emby-cache-tool/0.1",
+  "timeout": 30,
+  "chunk_size": 1048576,
+  "segments": 4,
+  "experimental_force_multipart": false,
+  "proxy": "",
+  "proxy_http": "",
+  "proxy_https": "",
+  "log_dir": "logs",
+  "log_level": "INFO",
+  "stream_segments": 2
+}
