@@ -6,6 +6,30 @@
 
 ---
 
+## ⚠️ Disclaimer / 免责声明
+
+> **仅限个人合法使用（For personal, legitimate use only）。**
+>
+> **emby-archiver 是一个技术中立的工具。** 与所有通用软件一样，它本身没有立场——**技术无罪，关键在于你怎么用**。
+>
+> 使用者须自行确认并承担以下责任：
+> - 对你下载、归档的内容拥有合法权利（例如：你本人拥有该媒体，或内容位于你运营/获授权使用的服务器上）。
+> - 遵守所在国家/地区的法律法规，以及所连接服务器的服务条款（ToS）。
+>
+> 本项目按 **「现状」(as is)** 提供，不附带任何明示或暗示的担保。作者**不鼓励、不纵容、亦不协助**任何侵犯版权、未经授权的再分发，或违反适用法律与第三方条款的行为。如因不当使用产生的任何后果，均由使用者自行承担。
+
+> **For personal, legitimate use only.**
+>
+> **emby-archiver is a technologically neutral tool.** Like any general-purpose software, it takes no side — *the technology is innocent; what matters is how you use it*.
+>
+> You are solely responsible for ensuring and abiding by:
+> - Having the legal right to archive the content you download (e.g. media you own, or content hosted on a server you operate or are authorized to use).
+> - The laws and regulations of your jurisdiction, as well as the terms of service (ToS) of any server you connect to.
+>
+> This project is provided **"as is"**, without warranty of any kind. The authors do **not** encourage, condone, or assist copyright infringement, unauthorized redistribution, or any misuse that violates applicable law or third-party terms. Any consequences arising from misuse are solely the user's responsibility.
+
+---
+
 ## Description / 项目描述
 
 ### English
@@ -23,8 +47,8 @@ Key design choices:
 - Multi-threaded segmented downloading with automatic single-thread fallback when the server doesn't support `Range`
 - `.part`-based pause/resume so downloads survive network flake
 - SQLite-backed record tracking so completed items are never re-downloaded
-- Works around the no-`DownloadContent` reality by falling back to `Videos/stream` candidates
-- Optional experimental force-multipart probing for stubborn servers
+- Falls back to the playable stream (the same source the built-in player uses) when no download endpoint is available
+- Optional experimental multipart probing for servers with unusual stream setups
 
 ### 中文
 
@@ -41,8 +65,8 @@ Key design choices:
 - 多线程分段下载，服务端不支持 `Range` 时自动回退单线程
 - 基于 `.part` 的暂停/续传，网络抖动后还能接着下
 - SQLite 记录追踪，已完成项永不重复下载
-- 针对无 `DownloadContent` 权限的现实，走 `Videos/stream` 候选链路
-- 可选的实验性强制分段探测，对付顽固服务端
+- 服务端未开放下载入口时，回退到可播放流（与内置播放器同源）
+- 可选的实验性分段探测，适配特殊服务端
 
 ---
 
@@ -50,29 +74,27 @@ Key design choices:
 
 ### English
 
-If you have an Emby server account and want to save the movies and shows you can access — whether on a laptop, a small NAS box, or a phone running Termux — this tool is for you.
+If you run or are authorized to use an Emby server and want to archive the media you have the right to access — whether on a laptop, a small NAS box, or a phone running Termux — this tool is for you.
 
-It was born from a few real needs:
+It was born from a few real, legitimate needs:
 
-- Your home Emby server has great content but spotty internet; download once, watch anywhere offline
-- Shared-accounts can disappear anytime; archive while you still can
+- Your own Emby server has great content but spotty internet; download once, watch anywhere offline
 - You want a downloader on a headless VPS/NAS/Termux box with no GUI
-- Emby's web player doesn't support every codec; offline transcode is more reliable
-- Your account lacks `DownloadContent` permission, so `Items/{id}/Download` returns 403 — you need to roll your own via `Videos/stream`
+- Emby's web player doesn't support every codec; offline archiving is more reliable
+- Your server may not expose a download button (e.g. the admin hasn't enabled `DownloadContent`); the tool retrieves the same playable stream the built-in player uses, so you can archive your own library
 
 Most existing Emby clients focus on playback. There was a gap for a **pure offline archiving tool**. emby-archiver fills that gap.
 
 ### 中文
 
-如果你有一个 Emby 服务器账号，想把能访问的电影和剧集保存下来——无论是笔记本、NAS 小主机、还是跑着 Termux 的手机——这就是为你做的工具。
+如果你运营或获授权使用一个 Emby 服务器，想把有权访问的媒体资源归档保存——无论是笔记本、NAS 小主机、还是跑着 Termux 的手机——这就是为你做的工具。
 
-它来自这些真实需求：
+它来自这些真实且正当的需求：
 
-- 家里 Emby 服务器资源不错，但网络不稳定，想下载一次随时离线看
-- 共享账号随时可能关停，趁能访问时赶紧存下来
+- 自己的 Emby 服务器资源不错，但网络不稳定，想下载一次随时离线看
 - 想在无图形环境的服务器 / NAS / Termux 上也能跑下载工具
 - Emby Web 播放器不支持所有编码，离线转存更靠谱
-- 账号没有 `DownloadContent` 权限，`Items/{id}/Download` 返回 403，需要绕道 `Videos/stream` 自己处理下载链路
+- 服务器可能未开放下载按钮（例如管理员未启用 `DownloadContent`）；工具获取的是内置播放器使用的同一路流，便于你归档自己的媒体库
 
 现有 Emby 客户端大多偏播放，**纯粹的离线归档工具**是空白。emby-archiver 就是来填这个空白的。
 
@@ -113,7 +135,7 @@ Most existing Emby clients focus on playback. There was a gap for a **pure offli
 - 支持 `.part` 临时文件断点续传
 - 用 SQLite 记录缓存状态
 - 优先走多线程分段下载，不支持 `Range` 时自动回退单线程
-- 可选开启实验性强制分段探测
+- 可选开启实验性分段探测
 - 支持为认证和下载链路配置 HTTP/HTTPS 代理
 
 ### Web 特有功能
@@ -198,7 +220,7 @@ python app.py --mode web --host 0.0.0.0 --port 8765
 | `download_dir` | 默认下载目录，相对路径或绝对路径均可 |
 | `database_path` | SQLite 数据库路径 |
 | `segments` | 分段并发数（1-32），仅服务端支持 Range 时生效 |
-| `experimental_force_multipart` | 是否开启实验性强制分段探测 |
+| `experimental_force_multipart` | 是否开启实验性分段探测 |
 | `proxy` | 同时作用于 HTTP/HTTPS 的代理 |
 | `proxy_http` / `proxy_https` | 分别配置 HTTP/HTTPS 代理 |
 | `log_dir` | 日志目录，默认 `logs/` |
@@ -260,7 +282,7 @@ Web 支持：测试登录、搜索资源、发起下载、单次指定下载目�
 
 1. 默认使用 `segments` 设置的并发数
 2. 服务端不支持 `Range` 时自动回退单线程
-3. 开启 `experimental_force_multipart` 后，会直接试探真实分段请求验证是否可强制分段
+3. 开启 `experimental_force_multipart` 后，会直接试探真实分段请求验证是否可分段的转存链路
 4. `stream_segments` 控制 `Videos/stream` 候选允许的最大分段数，避免一上来用太高并发把流地址打崩
 5. 已有 `.part` 断点文件需要续传时，自动走单线程续传
 
@@ -276,7 +298,7 @@ Web 支持：测试登录、搜索资源、发起下载、单次指定下载目�
 - GUI / Web 日志会显示候选地址类型、标准 Range 探测结果、实验分段探测结果和最终决策
 - 下载记录会保存本次任务最终使用的模式，例如：
   - `分段并发下载（4 段）`
-  - `实验性强制分段下载（4 段）`
+  - `实验性分段下载（4 段）`
   - `单线程续传（保留已有 .part）`
   - `单线程回退（服务端不支持分段）`
 
@@ -297,7 +319,7 @@ Web 支持：测试登录、搜索资源、发起下载、单次指定下载目�
 
 ## 已知限制
 
-- 共享账号服务器如果限制 API，可能无法登录或无法下载
+- 部分服务器如果限制 API，可能无法登录或无法下载
 - 某些服务器只给短期播放链接，失败时建议改用 `access_token`
 - 正在运行中的旧下载进程不会热更新，必须重启 GUI / Web / 脚本后新逻辑才会生效
 - 当前暂停/继续是进程内控制；如果直接关掉 GUI 或 Web 服务，需要靠 `.part` + `resume` 恢复
