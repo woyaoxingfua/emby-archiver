@@ -102,7 +102,15 @@ Most existing Emby clients focus on playback. There was a gap for a **pure offli
 
 ## 预览
 
-> UI 截图已移除，避免暴露真实服务器地址与媒体内容。后续补充截图时，请使用示例/脱敏数据。
+> 以下截图为占位示例数据（`your-emby-server.example.com` / `Sample ...`），仅展示界面布局，不包含真实服务器地址或媒体内容。
+
+### Web UI 概览
+
+![Web UI 概览](docs/images/web-ui-overview.png)
+
+### 日志面板
+
+![日志面板](docs/images/web-ui-logs.png)
 
 支持多历史日志文件切换、级别过滤、关键词搜索、自动滚动、加载更多。
 
