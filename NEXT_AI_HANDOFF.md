@@ -43,9 +43,9 @@
 
 补充：
 
-- 用户下载的是共享账号可访问资源
-- 经验证，用户账号 **没有 `DownloadContent` 权限**
-- 因此 `Items/{id}/Download` 常见 `403`
+- 用户下载的是自己可访问的媒体资源
+- 经验证，服务端未开放 `DownloadContent` 下载入口
+- 因此 `Items/{id}/Download` 可能不可用
 - 真正常用可行候选通常是：`Videos/{id}/stream?...`
 - 工具必须继续围绕这个现实约束工作
 
@@ -149,7 +149,7 @@ Tkinter GUI 已支持：
 
 - 标准分段并发下载
 - 服务端不支持 Range 时自动回退单线程
-- 实验性强制分段
+- 实验性分段
 - 下载链路代理复用
 - 丰富诊断日志
 - 暂停 / 继续 / 取消
@@ -638,9 +638,9 @@ SQLite 下载记录。
 
 ### 10.3 不要忽视 `Videos/stream` 的现实优先级
 
-由于用户账号无 `DownloadContent` 权限：
+由于服务端未开放 `DownloadContent` 下载入口：
 
-- `Items/.../Download` 常会 403
+- `Items/.../Download` 可能不可用
 - `Videos/.../stream` 才是现实常用下载候选
 
 ### 10.4 不要误判“并发没生效”
