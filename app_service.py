@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -10,9 +12,9 @@ from pathlib import Path
 from typing import Any
 
 from config import load_config, save_default_download_dir
-from downloader import DownloadCancelled, Downloader
-from emby_client import EmbyClient
-from library import CacheLibrary
+from downloader import DownloadCancelled, DownloadError, Downloader
+from emby_client import EmbyClient, EmbyClientError
+from library import CacheLibrary, redact_url
 from logger import get_logger, setup_logging
 from models import DownloadRecord, MediaItem
 
@@ -49,6 +51,17 @@ def _human_eta(seconds: float) -> str:
     if minutes:
         return f"{minutes}m {sec}s"
     return f"{sec}s"
+
+
+def _open_path(path: Path) -> None:
+    # N17：跨平台打开文件/目录，替代 Windows-only 的 os.startfile
+    if sys.platform == "win32":
+        os.startfile(path)  # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)])
+    else:
+        opener = "termux-open" if os.environ.get("TERMUX_VERSION") else "xdg-open"
+        subprocess.Popen([opener, str(path)])
 
 
 class AppService:
@@ -93,6 +106,9 @@ class AppService:
         self.config = config
         self.client = EmbyClient(config)
         self.library = CacheLibrary(config.database_path)
+        interrupted = self.library.reconcile_interrupted()
+        if interrupted:
+            self._record_log(f"启动对账：{interrupted} 条残留 downloading 记录已标记为 interrupted")
         self.downloader = Downloader(
             self.client,
             self.library,
@@ -247,20 +263,22 @@ class AppService:
         override_dir: Path | None = None,
     ) -> None:
         self.ensure_ready()
-        self._ensure_idle()
         assert self.client is not None
-        self._worker = threading.Thread(
-            target=self._download_item_task,
-            args=(item_id, force_restart, override_dir),
-            daemon=True,
-        )
-        self._worker.start()
+        with self._state_lock:
+            self._ensure_idle()
+            self._worker = threading.Thread(
+                target=self._download_item_task,
+                args=(item_id, force_restart, override_dir),
+                daemon=True,
+            )
+            self._worker.start()
 
     def resume_record(self, item_id: str) -> None:
         self.ensure_ready()
-        self._ensure_idle()
-        self._worker = threading.Thread(target=self._resume_record_task, args=(item_id,), daemon=True)
-        self._worker.start()
+        with self._state_lock:
+            self._ensure_idle()
+            self._worker = threading.Thread(target=self._resume_record_task, args=(item_id,), daemon=True)
+            self._worker.start()
 
     def pause_current(self) -> None:
         self.ensure_ready()
@@ -282,10 +300,17 @@ class AppService:
 
     def delete_record(self, item_id: str) -> dict[str, Any]:
         self.ensure_ready()
-        assert self.library is not None
+        assert self.library is not None and self.downloader is not None
         record = self.library.get(item_id)
         if not record:
             raise RuntimeError("Record not found")
+        # N15：删除进行中记录前先取消任务并等待 worker 退出，避免记录复活/文件占用
+        with self._state_lock:
+            active_id = self._download_state.get("item_id")
+            worker = self._worker
+        if active_id == item_id and worker and worker.is_alive():
+            self.downloader.cancel(cleanup_temp=True)
+            worker.join(timeout=15)
         path = Path(record.target_path)
         removed_file = False
         if path.exists():
@@ -293,8 +318,12 @@ class AppService:
             removed_file = True
         temp_path = path.with_name(path.name + ".part")
         temp_path.unlink(missing_ok=True)
-        for seg_path in temp_path.parent.glob(f"{temp_path.name}.seg*"):
-            seg_path.unlink(missing_ok=True)
+        # N9：iterdir+startswith 替代 glob，兼容 [ ] 等元字符标题
+        seg_prefix = temp_path.name + ".seg"
+        if temp_path.parent.exists():
+            for seg_path in temp_path.parent.iterdir():
+                if seg_path.is_file() and seg_path.name.startswith(seg_prefix):
+                    seg_path.unlink(missing_ok=True)
         self.library.delete(item_id)
         if removed_file:
             self._record_log(f"已删除文件和记录：{path}")
@@ -311,7 +340,7 @@ class AppService:
         path = Path(record.target_path)
         if not path.exists():
             raise RuntimeError(f"File not found: {path}")
-        os.startfile(path)  # type: ignore[attr-defined]
+        _open_path(path)
         self._record_log(f"已打开文件：{path}")
         return str(path)
 
@@ -324,7 +353,7 @@ class AppService:
         folder = Path(record.target_path).parent
         if not folder.exists():
             raise RuntimeError(f"Directory not found: {folder}")
-        os.startfile(folder)  # type: ignore[attr-defined]
+        _open_path(folder)
         self._record_log(f"已打开目录：{folder}")
         return str(folder)
 
@@ -383,16 +412,24 @@ class AppService:
                 self._record_log(f"准备下载 {len(items)} 个条目：{items[0].name}")
             if force_restart:
                 self._record_log("已启用忽略 .part 重新开始")
+            ok = failed = skipped = 0
             for item in items:
                 try:
                     path = self.downloader.download_item(item, force_restart=force_restart)
                     if self.downloader.last_result_status == "skipped":
+                        skipped += 1
                         self._record_log(f"已存在，跳过下载：{path}")
                     else:
+                        ok += 1
                         self._record_log(f"已保存：{path}")
                 except DownloadCancelled:
                     self._record_log(f"已取消：{item.name}")
                     break
+                except (DownloadError, EmbyClientError, OSError) as exc:
+                    failed += 1
+                    self._record_log(f"单集失败，继续下一集：{item.name}（{exc}）")
+                    continue
+            self._record_log(f"批量下载结束：成功 {ok} / 失败 {failed} / 跳过 {skipped}")
         except Exception as exc:
             self._mark_failed(str(exc))
             self._record_log(f"下载任务失败：{exc}")
@@ -610,4 +647,6 @@ class AppService:
 
     @staticmethod
     def _record_to_dict(record: DownloadRecord) -> dict[str, Any]:
-        return asdict(record)
+        data = asdict(record)
+        data["source_url"] = redact_url(data.get("source_url"))
+        return data

@@ -1,19 +1,47 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from models import DownloadRecord, MediaItem
+
+
+# N3：source_url 中可能携带 api_key/access_token 等长期凭据，存储/序列化前一律剥离
+_SENSITIVE_QUERY_KEYS = {"api_key", "apikey", "access_token", "token", "x-emby-token"}
+
+
+def redact_url(url: str | None) -> str | None:
+    if not url:
+        return url
+    try:
+        parts = urlsplit(url)
+        if not parts.query:
+            return url
+        kept = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+                if k.lower() not in _SENSITIVE_QUERY_KEYS]
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(kept), parts.fragment))
+    except ValueError:
+        return url
 
 
 class CacheLibrary:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
+        self._local = threading.local()
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.db_path)
+        # N10：每线程复用单连接 + WAL + busy_timeout，避免每操作新建连接与写锁竞争
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.db_path, timeout=5.0)
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            self._local.conn = conn
+        return conn
 
     def _init_db(self) -> None:
         with self._connect() as conn:
@@ -39,7 +67,29 @@ class CacheLibrary:
             }
             if "download_mode" not in columns:
                 conn.execute("ALTER TABLE downloads ADD COLUMN download_mode TEXT")
+            # N10：WAL 模式（持久化到 DB 文件），读写并发更友好
+            conn.execute("PRAGMA journal_mode=WAL")
+            # N3：清洗历史记录中残留的 URL 凭据（幂等）
+            rows = conn.execute(
+                "SELECT item_id, source_url FROM downloads WHERE source_url IS NOT NULL"
+            ).fetchall()
+            for item_id, surl in rows:
+                clean = redact_url(surl)
+                if clean != surl:
+                    conn.execute(
+                        "UPDATE downloads SET source_url=? WHERE item_id=?", (clean, item_id)
+                    )
             conn.commit()
+
+    def reconcile_interrupted(self) -> int:
+        # N19：启动对账——把进程崩溃残留的 downloading 僵尸记录标记为 interrupted
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE downloads SET status='interrupted', updated_at=CURRENT_TIMESTAMP "
+                "WHERE status='downloading'"
+            )
+            conn.commit()
+            return cur.rowcount
 
     def get(self, item_id: str) -> DownloadRecord | None:
         with self._connect() as conn:
@@ -61,6 +111,7 @@ class CacheLibrary:
         source_url: str | None,
         download_mode: str | None = None,
     ) -> None:
+        source_url = redact_url(source_url)
         with self._connect() as conn:
             current_mode = conn.execute(
                 "SELECT download_mode FROM downloads WHERE item_id = ?",
