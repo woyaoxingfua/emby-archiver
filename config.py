@@ -55,6 +55,12 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
         log_level=parse_log_level(raw.get("log_level")),
         stream_segments=max(1, int(raw.get("stream_segments", 2))),
         web_allowed_hosts=tuple(str(h).strip() for h in raw.get("web_allowed_hosts", []) if str(h).strip()),
+        retry_attempts=max(1, int(raw.get("retry_attempts", 3))),
+        retry_backoff_base=max(0.0, float(raw.get("retry_backoff_base", 0.5))),
+        retry_backoff_max=max(0.0, float(raw.get("retry_backoff_max", 8.0))),
+        slow_threshold_kbps=max(0.0, float(raw.get("slow_threshold_kbps", 50))),
+        slow_window_seconds=max(1.0, float(raw.get("slow_window_seconds", 30))),
+        rate_limit_kbps=max(0, int(raw.get("rate_limit_kbps", 0))),
     )
 
     cfg.download_dir.mkdir(parents=True, exist_ok=True)

@@ -185,10 +185,12 @@ class EmbyClient:
         ]
         return list(dict.fromkeys(candidates))
 
-    def open_stream(self, url: str, resume_from: int = 0) -> requests.Response:
+    def open_stream(self, url: str, resume_from: int = 0, if_range: str | None = None) -> requests.Response:
         headers = {"Accept-Encoding": "identity"}  # P3：禁止 gzip，保证 Content-Length/Range 语义正确
         if resume_from > 0:
             headers["Range"] = f"bytes={resume_from}-"
+            if if_range:
+                headers["If-Range"] = if_range  # N16：源同一性校验，ETag 不匹配时服务端返 200 全量
         response = self.session.get(
             url,
             headers=headers,

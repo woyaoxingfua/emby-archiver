@@ -27,6 +27,12 @@ class AppConfig:
     log_level: str = "INFO"
     stream_segments: int = 2
     web_allowed_hosts: tuple[str, ...] = ()
+    retry_attempts: int = 3
+    retry_backoff_base: float = 0.5
+    retry_backoff_max: float = 8.0
+    slow_threshold_kbps: float = 50.0
+    slow_window_seconds: float = 30.0
+    rate_limit_kbps: int = 0
 
 
 @dataclass(slots=True)
@@ -54,3 +60,4 @@ class DownloadRecord:
     expected_size: Optional[int] = None
     download_mode: Optional[str] = None
     source_url: Optional[str] = None
+    etag: Optional[str] = None

@@ -67,6 +67,8 @@ class CacheLibrary:
             }
             if "download_mode" not in columns:
                 conn.execute("ALTER TABLE downloads ADD COLUMN download_mode TEXT")
+            if "etag" not in columns:
+                conn.execute("ALTER TABLE downloads ADD COLUMN etag TEXT")
             # N10：WAL 模式（持久化到 DB 文件），读写并发更友好
             conn.execute("PRAGMA journal_mode=WAL")
             # N3：清洗历史记录中残留的 URL 凭据（幂等）
@@ -94,7 +96,7 @@ class CacheLibrary:
     def get(self, item_id: str) -> DownloadRecord | None:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT item_id, item_name, item_type, target_path, status, bytes_downloaded, expected_size, download_mode, source_url FROM downloads WHERE item_id = ?",
+                "SELECT item_id, item_name, item_type, target_path, status, bytes_downloaded, expected_size, download_mode, source_url, etag FROM downloads WHERE item_id = ?",
                 (item_id,),
             ).fetchone()
         if not row:
@@ -110,19 +112,21 @@ class CacheLibrary:
         expected_size: int | None,
         source_url: str | None,
         download_mode: str | None = None,
+        etag: str | None = None,
     ) -> None:
         source_url = redact_url(source_url)
         with self._connect() as conn:
-            current_mode = conn.execute(
-                "SELECT download_mode FROM downloads WHERE item_id = ?",
+            current = conn.execute(
+                "SELECT download_mode, etag FROM downloads WHERE item_id = ?",
                 (item.item_id,),
             ).fetchone()
-            resolved_mode = download_mode if download_mode is not None else (current_mode[0] if current_mode else None)
+            resolved_mode = download_mode if download_mode is not None else (current[0] if current else None)
+            resolved_etag = etag if etag is not None else (current[1] if current else None)
             conn.execute(
                 """
                 INSERT INTO downloads (
-                    item_id, item_name, item_type, target_path, status, bytes_downloaded, expected_size, download_mode, source_url, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    item_id, item_name, item_type, target_path, status, bytes_downloaded, expected_size, download_mode, source_url, etag, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(item_id) DO UPDATE SET
                     item_name = excluded.item_name,
                     item_type = excluded.item_type,
@@ -132,6 +136,7 @@ class CacheLibrary:
                     expected_size = excluded.expected_size,
                     download_mode = excluded.download_mode,
                     source_url = excluded.source_url,
+                    etag = excluded.etag,
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
@@ -144,6 +149,7 @@ class CacheLibrary:
                     expected_size,
                     resolved_mode,
                     source_url,
+                    resolved_etag,
                 ),
             )
             conn.commit()
@@ -151,7 +157,7 @@ class CacheLibrary:
     def list_all(self) -> Iterable[DownloadRecord]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT item_id, item_name, item_type, target_path, status, bytes_downloaded, expected_size, download_mode, source_url FROM downloads ORDER BY rowid DESC"
+                "SELECT item_id, item_name, item_type, target_path, status, bytes_downloaded, expected_size, download_mode, source_url, etag FROM downloads ORDER BY rowid DESC"
             ).fetchall()
         return [DownloadRecord(*row) for row in rows]
 
@@ -163,6 +169,6 @@ class CacheLibrary:
     def list_incomplete(self) -> Iterable[DownloadRecord]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT item_id, item_name, item_type, target_path, status, bytes_downloaded, expected_size, download_mode, source_url FROM downloads WHERE status NOT IN ('completed', 'cancelled') ORDER BY rowid DESC"
+                "SELECT item_id, item_name, item_type, target_path, status, bytes_downloaded, expected_size, download_mode, source_url, etag FROM downloads WHERE status NOT IN ('completed', 'cancelled') ORDER BY rowid DESC"
             ).fetchall()
         return [DownloadRecord(*row) for row in rows]

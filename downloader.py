@@ -161,7 +161,14 @@ class Downloader:
             )
             self.library.upsert(item, target_path, "downloading", resume_from, None, None, download_mode="准备中")
             self._emit("starting", item, resume_from, None, target_path)
-            candidates = self.client.get_download_candidates(item)
+            try:
+                candidates = self.client.get_download_candidates(item)
+            except (EmbyClientError, DownloadError, OSError) as exc:
+                # 候选地址获取失败也标记 failed，避免记录停留 downloading（审计 §5.5）
+                self.last_result_status = "failed"
+                self.library.upsert(item, target_path, "failed", resume_from, None, None, download_mode="下载失败")
+                self._emit("failed", item, resume_from, None, target_path)
+                raise DownloadError(f"无法获取下载候选地址 for {item.name}: {exc}")
             last_error: Exception | None = None
             resume_single_notice = temp_path.exists() and not self._segment_files(temp_path)
             if self.segments > 1 and resume_single_notice:
@@ -319,7 +326,10 @@ class Downloader:
         self.library.upsert(item, target_path, "downloading", resume_from, None, url, download_mode=mode_detail)
         self._emit("mode", item, resume_from, None, target_path, mode_detail)
 
-        response = self.client.open_stream(url, resume_from=resume_from)
+        prior = self.library.get(item.item_id)
+        prior_etag = prior.etag if prior else None
+        response = self.client.open_stream(url, resume_from=resume_from, if_range=prior_etag if resume_from else None)
+        resp_etag = response.headers.get("ETag")
 
         logger.info("Open stream response: HTTP %s, Content-Length=%s, Accept-Ranges=%s",
                     response.status_code,
@@ -327,13 +337,14 @@ class Downloader:
                     response.headers.get("Accept-Ranges", "-"))
 
         def _restart_from_scratch(reason: str):
-            nonlocal resume_from, response
+            nonlocal resume_from, response, resp_etag
             self._emit("diagnostic", item, resume_from, None, target_path, reason)
             logger.warning("%s for %s, restarting from scratch", reason, item.name)
             temp_path.unlink(missing_ok=True)
             resume_from = 0
             response.close()
             response = self.client.open_stream(url, resume_from=0)
+            resp_etag = response.headers.get("ETag")
 
         if resume_from and response.status_code == 200:
             _restart_from_scratch("续传请求返回 HTTP 200，服务端未接受续传，已自动从头重下")
@@ -342,6 +353,10 @@ class Downloader:
             parsed = _parse_content_range(response.headers.get("Content-Range", ""))
             if parsed is None or parsed[0] != resume_from:
                 _restart_from_scratch("续传返回的 Content-Range 起始偏移与断点不一致，已自动从头重下")
+
+        # N16：续传返回的 ETag 与历史不一致 → 源已变更（即使尺寸相同），从头重下
+        if resume_from and resp_etag and prior_etag and resp_etag != prior_etag:
+            _restart_from_scratch("续传返回的 ETag 与历史记录不一致（源已变更），已自动从头重下")
 
         expected_size = _expected_size(response, resume_from)
         # N16（部分）：续传时服务端总大小与历史记录不一致 → 源已变更，从头重下
@@ -353,7 +368,7 @@ class Downloader:
         self._current_expected = expected_size
         if expected_size is not None:
             self._check_disk_space(target_path.parent, expected_size, resume_from, multipart=False)
-            self.library.upsert(item, target_path, "downloading", resume_from, expected_size, url, download_mode=mode_detail)
+            self.library.upsert(item, target_path, "downloading", resume_from, expected_size, url, download_mode=mode_detail, etag=resp_etag)
         write_mode = "ab" if resume_from else "wb"
         use_tqdm = self.progress_callback is None
         progress = (
@@ -382,7 +397,9 @@ class Downloader:
                 self._maybe_upsert_progress(item, target_path, current, expected_size, url, mode_detail)
                 self._emit("progress", item, current, expected_size, target_path)
                 slow_probe_start, slow_probe_bytes = self._detect_slow_speed(
-                    item, current, slow_probe_start, slow_probe_bytes, mode_detail
+                    item, current, slow_probe_start, slow_probe_bytes, mode_detail,
+                    threshold_bps=self.client.config.slow_threshold_kbps * 1024,
+                    window_seconds=self.client.config.slow_window_seconds,
                 )
 
         self._check_cancelled()
@@ -397,7 +414,7 @@ class Downloader:
 
         self._cleanup_segment_files(temp_path)
         temp_path.replace(target_path)
-        self.library.upsert(item, target_path, "completed", final_size, expected_size, url, download_mode=mode_detail)
+        self.library.upsert(item, target_path, "completed", final_size, expected_size, url, download_mode=mode_detail, etag=resp_etag)
         self._emit("completed", item, final_size, expected_size, target_path, mode_detail)
         return target_path
 
@@ -603,7 +620,7 @@ class Downloader:
                 shutdown.set()
                 return
 
-            max_attempts = 3
+            max_attempts = max(1, self.client.config.retry_attempts)
             attempts = 0
             while True:
                 if shutdown.is_set() or self.cancel_event.is_set():
@@ -660,7 +677,7 @@ class Downloader:
                             errors.append(exc)
                         shutdown.set()
                         return
-                    backoff = min(8.0, 0.5 * (2 ** (attempts - 1)))
+                    backoff = min(self.client.config.retry_backoff_max, self.client.config.retry_backoff_base * (2 ** (attempts - 1)))
                     logger.warning("Segment %s attempt %s failed (%s); retry in %.1fs", idx, attempts, exc, backoff)
                     deadline = time.monotonic() + backoff
                     while time.monotonic() < deadline:
@@ -842,9 +859,13 @@ class Downloader:
         elif item.type == "Episode":
             series = _sanitize(item.series_name or "Unknown Series")
             season_no = item.parent_index_number or 0
-            episode_no = item.episode_number or 0
+            episode_no = item.episode_number if item.episode_number is not None else 0
             season_dir = f"Season {season_no:02d}"
-            filename = f"S{season_no:02d}E{episode_no:02d} - {_sanitize(item.name)}{ext}"
+            name_part = _sanitize(item.name)
+            if item.episode_number is None:
+                # 缺少 IndexNumber 时用 item_id 兜底，避免多集碰撞覆盖 S01E00
+                name_part = f"{name_part} [{_sanitize(item.item_id)}]"
+            filename = f"S{season_no:02d}E{episode_no:02d} - {name_part}{ext}"
             path = base_dir / series / season_dir / filename
         else:
             path = base_dir / f"{_sanitize(item.name)}{ext}"
