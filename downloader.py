@@ -73,6 +73,8 @@ class Downloader:
         self._last_progress_db = 0.0
         self._progress_db_interval = 1.0
         self._current_expected: int | None = None
+        # 优化B：全局令牌桶限速（0=不限），分段并发共享同一带宽上限
+        self._limiter = _TokenBucket(client.config.rate_limit_kbps * 1024)
 
     def pause(self) -> None:
         """Signal the active download to pause."""
@@ -391,6 +393,7 @@ class Downloader:
                 self._wait_while_paused(item, target_path)
                 if not chunk:
                     continue
+                self._limiter.acquire(len(chunk))
                 handle.write(chunk)
                 progress_bar.update(len(chunk))
                 current = handle.tell()
@@ -661,6 +664,7 @@ class Downloader:
                                 raise DownloadCancelled("用户取消下载")
                             if not chunk:
                                 continue
+                            self._limiter.acquire(len(chunk))
                             handle.write(chunk)
                             with lock:
                                 downloaded_bytes += len(chunk)
@@ -942,6 +946,37 @@ class _NullProgress:
 
     def update(self, size: int) -> None:
         return None
+
+
+class _TokenBucket:
+    """线程安全令牌桶限速器。rate<=0 时 acquire 为无操作（不限速）。
+
+    容量为 1 秒的突发量；多线程共享同一桶以实现全局带宽上限。
+    """
+
+    def __init__(self, rate_bps: float) -> None:
+        self.rate = float(rate_bps)
+        self.capacity = max(self.rate, 1.0)
+        self.tokens = self.capacity
+        self.ts = time.monotonic()
+        self.lock = threading.Lock()
+
+    def acquire(self, n: int) -> None:
+        if self.rate <= 0 or n <= 0:
+            return
+        with self.lock:
+            if n > self.capacity:
+                self.capacity = float(n)
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                self.tokens = min(self.capacity, self.tokens + (now - self.ts) * self.rate)
+                self.ts = now
+                if self.tokens >= n:
+                    self.tokens -= n
+                    return
+                wait = (n - self.tokens) / self.rate
+            time.sleep(min(max(wait, 0.001), 0.2))
 
 
 def _movie_title(item: MediaItem) -> str:
