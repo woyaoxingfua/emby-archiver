@@ -137,7 +137,12 @@ Most existing Emby clients focus on playback. There was a gap for a **pure offli
 - 支持 `.part` 临时文件断点续传
 - 用 SQLite 记录缓存状态
 - 优先走多线程分段下载，不支持 `Range` 时自动回退单线程
-- 段级网络重试、完成尺寸校验、下载前磁盘空间预检
+- 段级网络重试（指数退避）、完成尺寸精确校验、下载前磁盘空间预检
+- ETag/If-Range 源同一性校验：续传时源变更（即使尺寸相同）自动从头重下，杜绝拼接损坏
+- 可配置全局下载限速（`rate_limit_kbps`，令牌桶，单/多线程共享带宽上限）
+- 暂停即断连：暂停时释放服务器连接，恢复后从断点重开 Range
+- 多版本媒体源自动择优（选最高质量源）
+- 启动时自动回收上次崩溃残留的中断记录，可一键继续
 - 可选开启实验性分段探测
 - 支持为认证和下载链路配置 HTTP/HTTPS 代理
 
@@ -233,6 +238,12 @@ Web 模式默认**仅监听 `127.0.0.1`**，并自 v0.2 起启用访问令牌鉴
   "log_dir": "logs",
   "log_level": "INFO",
   "stream_segments": 2,
+  "retry_attempts": 3,
+  "retry_backoff_base": 0.5,
+  "retry_backoff_max": 8.0,
+  "slow_threshold_kbps": 50.0,
+  "slow_window_seconds": 30.0,
+  "rate_limit_kbps": 0,
   "web_allowed_hosts": []
 }
 ```
@@ -254,6 +265,10 @@ Web 模式默认**仅监听 `127.0.0.1`**，并自 v0.2 起启用访问令牌鉴
 | `log_dir` | 日志目录，默认 `logs/` |
 | `log_level` | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` |
 | `stream_segments` | Videos/stream 候选允许的最大分段数，默认 2 |
+| `retry_attempts` | 段级网络重试次数，默认 3 |
+| `retry_backoff_base` / `retry_backoff_max` | 重试指数退避基数/上限（秒），默认 0.5 / 8.0 |
+| `slow_threshold_kbps` / `slow_window_seconds` | 慢速诊断阈值（KB/s）与观测窗口（秒），默认 50 / 30 |
+| `rate_limit_kbps` | 全局下载限速（KB/s），`0` 为不限速；单/多线程共享带宽上限 |
 | `web_allowed_hosts` | Web Host 白名单额外允许的主机名/IP 列表（远程访问时填写），默认 `[]` |
 
 ---
@@ -352,7 +367,8 @@ Web 支持：测试登录、搜索资源、发起下载、单次指定下载目�
 - 某些服务器只给短期播放链接，失败时建议改用 `access_token`
 - 正在运行中的旧下载进程不会热更新，必须重启 GUI / Web / 脚本后新逻辑才会生效
 - 当前暂停/继续是进程内控制；如果直接关掉 GUI 或 Web 服务，需要靠 `.part` + `resume` 恢复（启动时会自动把残留 `downloading` 记录对账为 `interrupted`）
-- 分段下载已加入段级重试与完成尺寸校验；但暂停期间仍保持连接，长时间暂停后服务端可能断流，继续时按断点续传重试（彻底的「暂停即断连、恢复重开 Range」见优化规划）
+- 暂停即断连：暂停时主动释放服务器连接，恢复后从断点重开 Range（单线程与分段均已支持）；分段暂停期间数据库状态仍显示 `downloading`
+- 暂无任务队列：同一时刻仅运行一个下载任务，整季/整部剧集为串行逐集（队列与可配置并发见优化规划）
 - HLS 分片合并仍未实现，部分特殊资源可能无法直接离线
 
 ---

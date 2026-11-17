@@ -17,6 +17,20 @@ class EmbyClientError(RuntimeError):
 logger = get_logger()
 
 
+def _pick_media_source(sources: list) -> dict:
+    """优化D：多版本媒体源择优——选 Size 最大者（默认最高质量），无 Size 时回退首个。"""
+    if not sources:
+        return {}
+
+    def _size(s: dict) -> int:
+        try:
+            return int(s.get("Size") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    return max(sources, key=_size)
+
+
 class EmbyClient:
     VERSION = "0.1"
 
@@ -164,7 +178,7 @@ class EmbyClient:
             params={"Fields": "MediaSources"},
         ).json()
         media_sources = detail.get("MediaSources") or []
-        source = media_sources[0] if media_sources else {}
+        source = _pick_media_source(media_sources)
         media_source_id = source.get("Id")
         container = item.container or source.get("Container") or "mp4"
 
@@ -277,7 +291,7 @@ class EmbyClient:
     @staticmethod
     def _to_media_item(item: dict[str, Any]) -> MediaItem:
         media_sources = item.get("MediaSources") or []
-        source = media_sources[0] if media_sources else {}
+        source = _pick_media_source(media_sources)
         return MediaItem(
             item_id=str(item.get("Id")),
             name=str(item.get("Name") or "Unnamed"),

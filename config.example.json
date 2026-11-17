@@ -19,5 +19,11 @@
   "log_dir": "logs",
   "log_level": "INFO",
   "stream_segments": 2,
+  "retry_attempts": 3,
+  "retry_backoff_base": 0.5,
+  "retry_backoff_max": 8.0,
+  "slow_threshold_kbps": 50.0,
+  "slow_window_seconds": 30.0,
+  "rate_limit_kbps": 0,
   "web_allowed_hosts": []
 }
