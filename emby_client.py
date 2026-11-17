@@ -41,6 +41,8 @@ class EmbyClient:
         self.api_key = config.api_key
         self.user_id = config.user_id
         self.device_id = platform.node() or config.device_name.replace(" ", "-")
+        # P3：连接超时与读取超时分离，避免连接阶段长时间挂起
+        self._timeout = (min(10, config.timeout), config.timeout)
         self._refresh_auth_headers()
 
     def authenticate(self) -> dict[str, Any]:
@@ -71,7 +73,7 @@ class EmbyClient:
                 self._url("/Users/AuthenticateByName"),
                 json=payload,
                 headers={"X-Emby-Authorization": self._authorization_header(include_token=False)},
-                timeout=self.config.timeout,
+                timeout=self._timeout,
             )
             if response.ok:
                 data = response.json()
@@ -184,14 +186,14 @@ class EmbyClient:
         return list(dict.fromkeys(candidates))
 
     def open_stream(self, url: str, resume_from: int = 0) -> requests.Response:
-        headers = {}
+        headers = {"Accept-Encoding": "identity"}  # P3：禁止 gzip，保证 Content-Length/Range 语义正确
         if resume_from > 0:
             headers["Range"] = f"bytes={resume_from}-"
         response = self.session.get(
             url,
             headers=headers,
             stream=True,
-            timeout=self.config.timeout,
+            timeout=self._timeout,
             allow_redirects=True,
         )
         if response.status_code in {200, 206}:
@@ -244,7 +246,7 @@ class EmbyClient:
         response = self.session.request(
             method,
             self._url(path),
-            timeout=self.config.timeout,
+            timeout=self._timeout,
             **kwargs,
         )
         if not response.ok:

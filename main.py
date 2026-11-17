@@ -11,7 +11,7 @@ warnings.filterwarnings(
 )
 
 from config import ConfigError, load_config
-from downloader import DownloadError, Downloader
+from downloader import DownloadCancelled, DownloadError, Downloader
 from emby_client import EmbyClient, EmbyClientError
 from library import CacheLibrary
 from logger import setup_logging
@@ -50,6 +50,7 @@ def main() -> int:
         setup_logging(log_dir, log_level)
         client = EmbyClient(config)
         library = CacheLibrary(config.database_path)
+        library.reconcile_interrupted()
         downloader = Downloader(client, library, segments=config.segments)
 
         if args.command == "login-test":
@@ -84,10 +85,24 @@ def main() -> int:
             client.authenticate()
             items = client.expand_download_items(args.item_id)
             print(f"Downloading {len(items)} item(s)...")
+            succeeded = failed = skipped = 0
             for item in items:
-                path = downloader.download_item(item)
-                print(f"Saved: {path}")
-            return 0
+                try:
+                    path = downloader.download_item(item)
+                    if downloader.last_result_status == "skipped":
+                        skipped += 1
+                        print(f"Skipped (exists): {path}")
+                    else:
+                        succeeded += 1
+                        print(f"Saved: {path}")
+                except DownloadCancelled:
+                    print(f"Cancelled: {item.name}", file=sys.stderr)
+                    break
+                except (DownloadError, EmbyClientError, OSError) as exc:
+                    failed += 1
+                    print(f"Failed: {item.name}: {exc}", file=sys.stderr)
+            print(f"Batch done: {succeeded} saved / {failed} failed / {skipped} skipped")
+            return 1 if failed else 0
 
         if args.command == "resume":
             client.authenticate()
@@ -95,11 +110,21 @@ def main() -> int:
             if not records:
                 print("No unfinished downloads.")
                 return 0
+            succeeded = failed = 0
             for record in records:
-                item = client.get_item(record.item_id)
-                path = downloader.download_item(item)
-                print(f"Saved: {path}")
-            return 0
+                try:
+                    item = client.get_item(record.item_id)
+                    path = downloader.download_item(item)
+                    succeeded += 1
+                    print(f"Saved: {path}")
+                except DownloadCancelled:
+                    print(f"Cancelled: {record.item_id}", file=sys.stderr)
+                    break
+                except (DownloadError, EmbyClientError, OSError) as exc:
+                    failed += 1
+                    print(f"Failed: {record.item_id}: {exc}", file=sys.stderr)
+            print(f"Resume done: {succeeded} saved / {failed} failed")
+            return 1 if failed else 0
 
         parser.error("Unknown command")
         return 2

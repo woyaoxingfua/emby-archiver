@@ -20,6 +20,16 @@ from emby_client import EmbyClient, EmbyClientError
 from library import CacheLibrary
 from logger import setup_logging
 from models import DownloadRecord, MediaItem
+from app_service import _open_path
+
+
+def _seg_files(temp_path: Path) -> list[Path]:
+    # N9：iterdir+startswith 替代 glob，兼容 [ ] 等元字符标题
+    prefix = temp_path.name + ".seg"
+    parent = temp_path.parent
+    if not parent.exists():
+        return []
+    return [p for p in parent.iterdir() if p.is_file() and p.name.startswith(prefix)]
 
 
 class EmbyCacheGui:
@@ -46,6 +56,8 @@ class EmbyCacheGui:
         self.search_results: list[MediaItem] = []
         self._speed_history: dict[str, list[tuple[float, int]]] = {}
         self._active_downloads = 0
+        self._download_busy = False
+        self._MAX_LOG_LINES = 2000
         self._download_state: dict[str, dict[str, object]] = {}
         self.segments_var = tk.IntVar(value=4)
         self.force_restart_var = tk.BooleanVar(value=False)
@@ -299,7 +311,7 @@ class EmbyCacheGui:
         if not selected:
             messagebox.showinfo("提示", "先选中一个搜索结果")
             return
-        if self._active_downloads > 0:
+        if self._download_busy or self._active_downloads > 0:
             messagebox.showinfo("提示", "已有下载任务进行中，请等待完成")
             return
         if not self.downloader or not self.client:
@@ -315,6 +327,7 @@ class EmbyCacheGui:
         force_restart = self._resolve_force_restart(item)
         if force_restart is None:
             return
+        self._download_busy = True  # N14：同步置忙，关闭事件轮询前的双 worker 竞态窗口
         self._run_background(self._download_task, item, force_restart, override_dir)
 
     def _resolve_force_restart(self, item: MediaItem) -> bool | None:
@@ -324,9 +337,7 @@ class EmbyCacheGui:
             return False
         target_path = self.downloader._build_target_path(item)
         temp_path = target_path.with_name(target_path.name + ".part")
-        has_partial = temp_path.exists() or any(
-            temp_path.parent.glob(f"{temp_path.name}.seg*")
-        )
+        has_partial = temp_path.exists() or bool(_seg_files(temp_path))
         if not has_partial:
             return False
         answer = messagebox.askyesnocancel(
@@ -456,13 +467,14 @@ class EmbyCacheGui:
         if record.status in {"completed", "cancelled"}:
             messagebox.showinfo("提示", "这条记录不需要继续下载")
             return
-        if self._active_downloads > 0:
+        if self._download_busy or self._active_downloads > 0:
             messagebox.showinfo("提示", "已有下载任务进行中，请等待完成")
             return
         if not self.client or not self.downloader:
             self.load_config_only()
         if not self.client or not self.downloader:
             return
+        self._download_busy = True  # N14
         self._run_background(self._resume_download_record_task, record.item_id)
 
     def play_selected_record(self) -> None:
@@ -476,7 +488,7 @@ class EmbyCacheGui:
             messagebox.showwarning("文件不存在", f"文件不存在：\n{path}\n\n你可以删除这条记录。")
             return
         try:
-            os.startfile(path)  # type: ignore[attr-defined]
+            _open_path(path)
             self.log(f"已打开文件：{path}")
         except OSError as exc:
             self.log(f"播放失败：{exc}")
@@ -494,7 +506,7 @@ class EmbyCacheGui:
             messagebox.showwarning("目录不存在", f"目录不存在：\n{folder}")
             return
         try:
-            os.startfile(folder)  # type: ignore[attr-defined]
+            _open_path(folder)
             self.log(f"已打开目录：{folder}")
         except OSError as exc:
             self.log(f"打开目录失败：{exc}")
@@ -519,7 +531,7 @@ class EmbyCacheGui:
                 file_removed = True
             temp_path = path.with_name(path.name + ".part")
             temp_path.unlink(missing_ok=True)
-            for seg_path in temp_path.parent.glob(f"{temp_path.name}.seg*"):
+            for seg_path in _seg_files(temp_path):
                 seg_path.unlink(missing_ok=True)
             assert self.library is not None
             self.library.delete(record.item_id)
@@ -781,7 +793,7 @@ class EmbyCacheGui:
         def runner() -> None:
             try:
                 func(*args)
-            except (ConfigError, EmbyClientError, DownloadError, OSError) as exc:
+            except Exception as exc:  # N13：任何后台异常都反馈到 UI，避免线程静默死亡
                 self.event_queue.put(("error", str(exc)))
 
         thread = threading.Thread(target=runner, daemon=True)
@@ -820,6 +832,7 @@ class EmbyCacheGui:
                 self.status_var.set(f"正在下载... (当前 {self._active_downloads} 个任务)")
                 self._update_download_record_buttons()
             elif event == "download_end":
+                self._download_busy = False
                 self._active_downloads = max(0, self._active_downloads - 1)
                 if self._active_downloads <= 0:
                     self.status_var.set("就绪")
@@ -840,6 +853,10 @@ class EmbyCacheGui:
     def log(self, message: str) -> None:
         self.log_text.configure(state="normal")
         self.log_text.insert("end", message + "\n")
+        # N12：限制日志行数，防止长时间运行内存膨胀与 Tk 渲染卡顿
+        line_count = int(self.log_text.index("end-1c").split(".")[0])
+        if line_count > self._MAX_LOG_LINES:
+            self.log_text.delete("1.0", f"{line_count - self._MAX_LOG_LINES}.0")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
         try:

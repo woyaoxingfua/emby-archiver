@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "emby-archiver"
+version = "0.2.0"
+description = "Offline archiver for Emby shared libraries (CLI / GUI / Web)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "requests>=2.31.0,<3",
+  "tqdm>=4.66.0,<5",
+  "starlette>=1.1.0,<2",
+  "uvicorn>=0.30.0,<1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[project.scripts]
+emby-archiver = "main:main"
+
+[tool.setuptools]
+py-modules = [
+  "main", "app", "app_service", "config", "downloader",
+  "emby_client", "gui", "library", "logger", "models", "webapp",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
