@@ -81,7 +81,7 @@ It was born from a few real, legitimate needs:
 - Your own Emby server has great content but spotty internet; download once, watch anywhere offline
 - You want a downloader on a headless VPS/NAS/Termux box with no GUI
 - Emby's web player doesn't support every codec; offline archiving is more reliable
-- Your server may not expose a download button (e.g. the admin hasn't enabled `DownloadContent`); the tool retrieves the same playable stream the built-in player uses, so you can archive your own library
+- On a server you operate or are authorized to archive, the tool can use the same playable stream the built-in player uses, so you can keep an offline copy of your own library
 
 Most existing Emby clients focus on playback. There was a gap for a **pure offline archiving tool**. emby-archiver fills that gap.
 
@@ -94,7 +94,7 @@ Most existing Emby clients focus on playback. There was a gap for a **pure offli
 - 自己的 Emby 服务器资源不错，但网络不稳定，想下载一次随时离线看
 - 想在无图形环境的服务器 / NAS / Termux 上也能跑下载工具
 - Emby Web 播放器不支持所有编码，离线转存更靠谱
-- 服务器可能未开放下载按钮（例如管理员未启用 `DownloadContent`）；工具获取的是内置播放器使用的同一路流，便于你归档自己的媒体库
+- 在你运营或获授权归档的服务器上，工具可使用与内置播放器同源的播放流，便于你为自己的媒体库保留离线副本
 
 现有 Emby 客户端大多偏播放，**纯粹的离线归档工具**是空白。emby-archiver 就是来填这个空白的。
 
@@ -137,11 +137,13 @@ Most existing Emby clients focus on playback. There was a gap for a **pure offli
 - 支持 `.part` 临时文件断点续传
 - 用 SQLite 记录缓存状态
 - 优先走多线程分段下载，不支持 `Range` 时自动回退单线程
+- 段级网络重试、完成尺寸校验、下载前磁盘空间预检
 - 可选开启实验性分段探测
 - 支持为认证和下载链路配置 HTTP/HTTPS 代理
 
 ### Web 特有功能
 
+- 访问令牌鉴权 + Host 白名单 + CSRF 防护（详见「Web 安全与鉴权」）
 - 搜索资源、发起下载、查看实时状态（速度/ETA/百分比/进度条）
 - 暂停 / 继续 / 取消当前下载（取消时可选删除/保留 .part 临时文件）
 - 设置默认下载目录（可持久化到 config.json）
@@ -163,8 +165,12 @@ cp config.example.json config.json
 
 ### 2. 安装依赖
 
+需要 **Python ≥ 3.10**。
+
 ```bash
 pip install -r requirements.txt
+# 或以包方式安装（提供 emby-archiver 命令）
+pip install .
 ```
 
 ### 3. 启动
@@ -176,11 +182,30 @@ python app.py
 # 强制 Web 模式
 python app.py --mode web --host 127.0.0.1 --port 8765
 
-# 局域网/手机访问（需配合安全措施）
+# 局域网/手机访问（默认仅监听本机；绑定 0.0.0.0 前请先阅读下方「Web 安全与鉴权」）
 python app.py --mode web --host 0.0.0.0 --port 8765
 ```
 
-打开浏览器访问：`http://127.0.0.1:8765`
+启动 Web 模式后，控制台会打印一条**带访问令牌**的链接，例如：
+
+```
+http://127.0.0.1:8765/?token=<随机令牌>
+```
+
+请用这条链接打开页面（首次访问会种下 HttpOnly Cookie，之后无需再带令牌）。令牌持久化在 `store/web_token.txt`，重启不变。详见下方「Web 安全与鉴权」。
+
+---
+
+## Web 安全与鉴权
+
+Web 模式默认**仅监听 `127.0.0.1`**，并自 v0.2 起启用访问令牌鉴权，防止局域网/公网未授权操作你的下载与 Emby 凭据：
+
+- **访问令牌**：启动时自动生成随机令牌，持久化于 `store/web_token.txt`（已 gitignore），重启保持不变。控制台打印带 `?token=` 的链接；首次访问种下 `HttpOnly` + `SameSite=Strict` Cookie，之后自动携带。
+- **API 鉴权**：所有 `/api/*` 请求必须携带有效 Cookie 或 `X-Auth-Token` 请求头，否则返回 `401`。
+- **Host 白名单**：仅允许 `localhost` / `127.0.0.1` / `::1` 及绑定地址访问，抵御 DNS rebinding；跨站 `Origin` 的状态变更请求被拒绝（CSRF 纵深防御）。
+- **远程/手机访问**：如需绑定 `0.0.0.0`，请在 `config.json` 的 `web_allowed_hosts` 中显式加入你通过其访问的主机名/IP（例如 NAS 的局域网域名），否则会被 Host 白名单拦截。仍建议优先用反向代理 + TLS，或 SSH 隧道，而非直接暴露公网。
+
+> 升级提示：旧版本 Web 无鉴权。升级后请用控制台打印的带令牌链接访问；直接访问 `http://host:port/` 会看到「需要访问令牌」页面。
 
 ---
 
@@ -207,7 +232,8 @@ python app.py --mode web --host 0.0.0.0 --port 8765
   "proxy_https": "",
   "log_dir": "logs",
   "log_level": "INFO",
-  "stream_segments": 2
+  "stream_segments": 2,
+  "web_allowed_hosts": []
 }
 ```
 
@@ -228,6 +254,7 @@ python app.py --mode web --host 0.0.0.0 --port 8765
 | `log_dir` | 日志目录，默认 `logs/` |
 | `log_level` | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` |
 | `stream_segments` | Videos/stream 候选允许的最大分段数，默认 2 |
+| `web_allowed_hosts` | Web Host 白名单额外允许的主机名/IP 列表（远程访问时填写），默认 `[]` |
 
 ---
 
@@ -324,8 +351,8 @@ Web 支持：测试登录、搜索资源、发起下载、单次指定下载目�
 - 部分服务器如果限制 API，可能无法登录或无法下载
 - 某些服务器只给短期播放链接，失败时建议改用 `access_token`
 - 正在运行中的旧下载进程不会热更新，必须重启 GUI / Web / 脚本后新逻辑才会生效
-- 当前暂停/继续是进程内控制；如果直接关掉 GUI 或 Web 服务，需要靠 `.part` + `resume` 恢复
-- 部分不稳定服务端在暂停太久后可能主动断流，继续时会自动按现有断点续传策略重试
+- 当前暂停/继续是进程内控制；如果直接关掉 GUI 或 Web 服务，需要靠 `.part` + `resume` 恢复（启动时会自动把残留 `downloading` 记录对账为 `interrupted`）
+- 分段下载已加入段级重试与完成尺寸校验；但暂停期间仍保持连接，长时间暂停后服务端可能断流，继续时按断点续传重试（彻底的「暂停即断连、恢复重开 Range」见优化规划）
 - HLS 分片合并仍未实现，部分特殊资源可能无法直接离线
 
 ---
@@ -348,6 +375,8 @@ emby-archiver/
 ├── config.json         # 配置文件（需自行创建）
 ├── config.example.json # 配置示例
 ├── requirements.txt    # 依赖声明
+├── pyproject.toml      # 包元数据（Python>=3.10）
+├── tests/              # 回归与冒烟测试（pytest）
 ├── docs/images/        # 截图
 ├── downloads/          # 默认下载目录
 ├── logs/               # 日志目录
@@ -362,3 +391,19 @@ emby-archiver/
 1. 直接用 `username` + `password`
 2. 如果服务器不让密码登录，改用 `access_token`
 3. 如果你拿到的是 `api_key`，最好同时填 `user_id`
+
+安全建议：
+- `config.json` 以明文保存凭据，请收紧文件权限（Linux/Termux：`chmod 600 config.json`），不要提交到版本库（已 gitignore）。
+- 优先使用 `api_key` / `access_token` 而非长期密码；下载记录与接口返回中的 URL 凭据会被自动剥离。
+- 远程使用 Web 时务必保留令牌鉴权，并优先通过 TLS 反向代理或 SSH 隧道访问。
+
+---
+
+## 测试
+
+```bash
+pip install pytest httpx
+python -m pytest tests -q
+```
+
+覆盖下载核心（路径安全/续传校验/段级重试/磁盘预检/进度节流）、存储与服务层（凭据剥离/WAL/启动对账/批量容错）、Web 安全（鉴权/Host/CSRF/XSS/脱敏）以及真实 uvicorn 全链路冒烟。
