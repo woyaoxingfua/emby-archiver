@@ -41,6 +41,18 @@ class MultipartUnavailable(DownloadError):
         self.fallback_mode = fallback_mode
 
 
+class _PausedAt(Exception):
+    """优化C：单线程暂停信号，携带断点偏移；由 _download_from_candidate 捕获后断连等待恢复。"""
+
+    def __init__(self, offset: int) -> None:
+        super().__init__(f"paused at {offset}")
+        self.offset = offset
+
+
+class _PauseRestart(Exception):
+    """优化C：分段暂停信号；关闭连接等待恢复后重开 Range，不计入重试次数。"""
+
+
 @dataclass(slots=True)
 class ProbeResult:
     status_code: int
@@ -328,6 +340,30 @@ class Downloader:
         self.library.upsert(item, target_path, "downloading", resume_from, None, url, download_mode=mode_detail)
         self._emit("mode", item, resume_from, None, target_path, mode_detail)
 
+        offset = resume_from
+        while True:
+            try:
+                return self._stream_single(item, target_path, temp_path, url, mode_detail, offset)
+            except _PausedAt as paused:
+                offset = paused.offset
+                # 优化C：暂停期间不持有连接，等待恢复后从断点重开 Range
+                logger.info("Download paused for %s at %d bytes; connection released", item.name, offset)
+                while self.pause_event.is_set() and not self.cancel_event.is_set():
+                    time.sleep(0.2)
+                if self.cancel_event.is_set():
+                    raise DownloadCancelled("用户取消下载")
+                self.library.upsert(item, target_path, "downloading", offset, self._current_expected, url, download_mode=mode_detail)
+                self._emit("mode", item, offset, self._current_expected, target_path, "继续下载")
+
+    def _stream_single(
+        self,
+        item: MediaItem,
+        target_path: Path,
+        temp_path: Path,
+        url: str,
+        mode_detail: str,
+        resume_from: int,
+    ) -> Path:
         prior = self.library.get(item.item_id)
         prior_etag = prior.etag if prior else None
         response = self.client.open_stream(url, resume_from=resume_from, if_range=prior_etag if resume_from else None)
@@ -390,7 +426,12 @@ class Downloader:
         with response, temp_path.open(write_mode) as handle, progress as progress_bar:
             for chunk in response.iter_content(chunk_size=self.client.config.chunk_size):
                 self._check_cancelled()
-                self._wait_while_paused(item, target_path)
+                if self.pause_event.is_set():
+                    # 优化C：暂停即断连——记录断点并抛出，外层关闭连接、等待恢复后重开 Range
+                    paused_bytes = handle.tell()
+                    self.library.upsert(item, target_path, "paused", paused_bytes, expected_size, url, download_mode=mode_detail, etag=resp_etag)
+                    self._emit("paused", item, paused_bytes, expected_size, target_path, "已暂停")
+                    raise _PausedAt(paused_bytes)
                 if not chunk:
                     continue
                 self._limiter.acquire(len(chunk))
@@ -657,11 +698,17 @@ class Downloader:
                             self._check_cancelled()
                             if shutdown.is_set():
                                 break
-                            # N20：暂停循环同时检查 shutdown，避免失败任务卡死在暂停里
-                            while self.pause_event.is_set() and not self.cancel_event.is_set() and not shutdown.is_set():
-                                time.sleep(0.2)
-                            if self.cancel_event.is_set():
-                                raise DownloadCancelled("用户取消下载")
+                            # 优化C：暂停即断连——先关闭连接，等待恢复期间不持有连接，再重开 Range
+                            if self.pause_event.is_set():
+                                if response is not None:
+                                    response.close()
+                                while self.pause_event.is_set() and not self.cancel_event.is_set() and not shutdown.is_set():
+                                    time.sleep(0.2)
+                                if self.cancel_event.is_set():
+                                    raise DownloadCancelled("用户取消下载")
+                                if shutdown.is_set():
+                                    return
+                                raise _PauseRestart()
                             if not chunk:
                                 continue
                             self._limiter.acquire(len(chunk))
@@ -670,6 +717,8 @@ class Downloader:
                                 downloaded_bytes += len(chunk)
                             emit_progress()
                     return  # 本段完成
+                except _PauseRestart:
+                    continue  # 恢复后重开 Range，不计入重试次数
                 except DownloadCancelled:
                     shutdown.set()
                     return
@@ -789,37 +838,6 @@ class Downloader:
         for seg_path in self._segment_files(temp_path):
             total += seg_path.stat().st_size
         return total
-
-    def _wait_while_paused(self, item: MediaItem, target_path: Path) -> None:
-        if not self.pause_event.is_set():
-            return
-        paused_bytes = self._paused_downloaded_bytes(self._current_temp_path or target_path.with_name(target_path.name + ".part"))
-        self.library.upsert(
-            item,
-            target_path,
-            "paused",
-            paused_bytes,
-            self._current_expected,
-            self._current_url,
-            download_mode=self._current_mode or "已暂停",
-        )
-        self._emit("paused", item, paused_bytes, None, target_path, "已暂停")
-        logger.info("Download paused for %s, waiting for resume", item.name)
-        while self.pause_event.is_set() and not self.cancel_event.is_set():
-            time.sleep(0.2)
-        if self.cancel_event.is_set():
-            raise DownloadCancelled("用户取消下载")
-        self.library.upsert(
-            item,
-            target_path,
-            "downloading",
-            paused_bytes,
-            self._current_expected,
-            self._current_url,
-            download_mode=self._current_mode or "继续下载",
-        )
-        self._emit("mode", item, paused_bytes, None, target_path, self._current_mode or "继续下载")
-        logger.info("Download resumed for %s", item.name)
 
     def _detect_slow_speed(
         self,
