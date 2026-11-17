@@ -26,6 +26,7 @@ class AppConfig:
     log_dir: Path = Path("logs")
     log_level: str = "INFO"
     stream_segments: int = 2
+    web_allowed_hosts: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)

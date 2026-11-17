@@ -52,8 +52,18 @@ def run_gui(config_path: str) -> None:
 def run_web(service: AppService, host: str, port: int) -> None:
     import uvicorn
 
-    logger.info("Starting web mode on http://%s:%s", host, port)
-    uvicorn.run(create_web_app(service), host=host, port=port, log_level="info")
+    allowed = {"localhost", "127.0.0.1", "::1"}
+    if host not in {"0.0.0.0", "::"}:
+        allowed.add(host)
+    if service.config is not None:
+        allowed.update(service.config.web_allowed_hosts)
+    web_app = create_web_app(service, allowed_hosts=allowed)
+    token = web_app.state.web_token
+    display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    url = f"http://{display_host}:{port}/?token={token}"
+    logger.warning("Web 访问令牌已启用，请用带令牌的链接访问（令牌持久化于 store/web_token.txt）：%s", url)
+    print(f"\n[Web] 访问地址（含令牌，请妥善保管）：{url}\n", flush=True)
+    uvicorn.run(web_app, host=host, port=port, log_level="info")
 
 
 def main() -> None:

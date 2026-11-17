@@ -54,6 +54,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
         log_dir=Path(raw.get("log_dir", "logs")),
         log_level=parse_log_level(raw.get("log_level")),
         stream_segments=max(1, int(raw.get("stream_segments", 2))),
+        web_allowed_hosts=tuple(str(h).strip() for h in raw.get("web_allowed_hosts", []) if str(h).strip()),
     )
 
     cfg.download_dir.mkdir(parents=True, exist_ok=True)

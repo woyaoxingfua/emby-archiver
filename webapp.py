@@ -1,17 +1,26 @@
 from __future__ import annotations
 
-import json
-import re
+import hmac
+import logging
+import secrets
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
+import anyio
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.routing import Route
 
 from app_service import AppService
+
+logger = logging.getLogger("emby_cache_tool.web")
+
+COOKIE_NAME = "emby_web_token"
+DEFAULT_ALLOWED_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
 HTML_PAGE = """<!doctype html>
@@ -355,9 +364,9 @@ async function refreshAll() {
       const progress = r.expected_size ? `${r.bytes_downloaded}/${r.expected_size}` : `${r.bytes_downloaded}`;
       let actions = '';
       if (!['completed', 'cancelled'].includes(r.status)) {
-        actions += `<button onclick="resumeRecord('${r.item_id}')">继续</button> `;
+        actions += `<button data-action="resume" data-id="${escapeHtml(r.item_id)}">继续</button> `;
       }
-      actions += `<button class="warn" onclick="deleteRecord('${r.item_id}', '${r.status}')">删除</button>`;
+      actions += `<button class="warn" data-action="delete" data-id="${escapeHtml(r.item_id)}" data-status="${escapeHtml(r.status)}">删除</button>`;
       return `<tr><td>${escapeHtml(r.status)}</td><td>${escapeHtml(r.item_name)}</td><td>${escapeHtml(progress)}</td><td>${escapeHtml(r.download_mode || '-')}</td><td class="path">${escapeHtml(r.target_path || '-')}</td><td>${actions}</td></tr>`;
     }).join('');
   } catch (e) {
@@ -402,7 +411,7 @@ async function searchItems() {
         <td>${escapeHtml(r.item_id)}</td>
         <td>${escapeHtml(r.type)}</td>
         <td>${escapeHtml(r.name)}</td>
-        <td><button onclick="startDownload('${r.item_id}')">下载</button></td>
+        <td><button data-action="download" data-id="${escapeHtml(r.item_id)}">下载</button></td>
       </tr>`).join('');
   } catch (e) {
     document.getElementById('status').textContent = e.message || e;
@@ -426,7 +435,7 @@ async function startDownload(itemId) {
 
 async function resumeRecord(itemId) {
   try {
-    await api(`/api/downloads/${itemId}/resume`, {method:'POST'});
+    await api(`/api/downloads/${encodeURIComponent(itemId)}/resume`, {method:'POST'});
     document.getElementById('status').textContent = '已请求继续下载';
   } catch (e) {
     document.getElementById('status').textContent = e.message || e;
@@ -441,7 +450,7 @@ async function deleteRecord(itemId, status) {
   }
   if (!confirm(msg)) return;
   try {
-    await api(`/api/downloads/${itemId}`, {method:'DELETE'});
+    await api(`/api/downloads/${encodeURIComponent(itemId)}`, {method:'DELETE'});
     document.getElementById('status').textContent = '已删除记录';
   } catch (e) {
     document.getElementById('status').textContent = e.message || e;
@@ -503,6 +512,18 @@ async function setSegments() {
   refreshAll();
 }
 
+// N6：事件委托替代内联 onclick，item_id 经 escapeHtml 进入 data-* 属性，杜绝属性内 JS 注入
+document.querySelector('#downloadsTable tbody').addEventListener('click', e => {
+  const btn = e.target.closest('button[data-action]');
+  if (!btn) return;
+  if (btn.dataset.action === 'resume') resumeRecord(btn.dataset.id);
+  else if (btn.dataset.action === 'delete') deleteRecord(btn.dataset.id, btn.dataset.status);
+});
+document.querySelector('#resultsTable tbody').addEventListener('click', e => {
+  const btn = e.target.closest('button[data-action="download"]');
+  if (btn) startDownload(btn.dataset.id);
+});
+
 setInterval(refreshAll, 3000);
 refreshAll();
 populateLogFiles();
@@ -512,13 +533,70 @@ populateLogFiles();
 """
 
 
+_LOGIN_PAGE = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<title>需要访问令牌</title></head>
+<body style="font-family:sans-serif;background:#111827;color:#e5e7eb;padding:40px;">
+<h2>需要访问令牌</h2>
+<p>请使用启动 Web 模式时控制台打印的带 <code>?token=</code> 的链接访问。</p>
+<p>令牌持久化在 <code>store/web_token.txt</code>。这是为了防止局域网/跨站请求未经授权操作你的下载与 Emby 凭据。</p>
+</body></html>"""
+
+
+def _normalize_host(value: str) -> str:
+    value = value.strip().lower()
+    if value.startswith("["):  # IPv6 [::1]:port
+        return value.split("]")[0][1:]
+    return value.split(":")[0]
+
+
+class _SecurityMiddleware(BaseHTTPMiddleware):
+    """N8：Host 白名单（防 DNS rebinding）+ 令牌鉴权（cookie/头）+ SameSite=Strict + Origin 校验。"""
+
+    async def dispatch(self, request: Request, call_next):
+        token = request.app.state.web_token
+        allowed = request.app.state.allowed_hosts
+        if _normalize_host(request.headers.get("host", "")) not in allowed:
+            return JSONResponse({"detail": "Host not allowed"}, status_code=403)
+
+        path = request.url.path
+        if path == "/" and request.method == "GET":
+            supplied = (parse_qs(request.url.query).get("token") or [""])[0]
+            cookie = request.cookies.get(COOKIE_NAME, "")
+            if supplied and hmac.compare_digest(supplied, token):
+                resp = RedirectResponse(url="/", status_code=302)
+                resp.set_cookie(COOKIE_NAME, token, httponly=True, samesite="strict", path="/")
+                return resp
+            if not (cookie and hmac.compare_digest(cookie, token)):
+                return HTMLResponse(_LOGIN_PAGE, status_code=401)
+            return await call_next(request)
+
+        if path.startswith("/api/"):
+            cookie = request.cookies.get(COOKIE_NAME, "")
+            header = request.headers.get("x-auth-token", "")
+            authorized = (cookie and hmac.compare_digest(cookie, token)) or (
+                header and hmac.compare_digest(header, token)
+            )
+            if not authorized:
+                return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+            if request.method in {"POST", "DELETE", "PUT", "PATCH"}:
+                origin = request.headers.get("origin")
+                if origin and _normalize_host(urlsplit(origin).hostname or "") not in allowed:
+                    return JSONResponse({"detail": "Origin not allowed"}, status_code=403)
+        return await call_next(request)
+
+
+async def _blocking(func):
+    # N5：把阻塞 I/O（requests/sqlite/文件读）移出事件循环，避免一次慢请求冻结整个 Web 服务
+    return await anyio.to_thread.run_sync(func)
+
+
 async def _index(_request: Request) -> Response:
     return HTMLResponse(HTML_PAGE)
 
 
 async def _summary(request: Request) -> Response:
     service = request.app.state.service
-    return _api_call(lambda: service.config_summary())
+    return await _blocking(lambda: _api_call(lambda: service.config_summary()))
 
 
 async def _status(request: Request) -> Response:
@@ -539,7 +617,7 @@ async def _logs(request: Request) -> Response:
 
 async def _log_files(request: Request) -> Response:
     service = request.app.state.service
-    return _api_call(lambda: service.list_log_files())
+    return await _blocking(lambda: _api_call(lambda: service.list_log_files()))
 
 
 async def _log_file(request: Request) -> Response:
@@ -559,12 +637,12 @@ async def _log_file(request: Request) -> Response:
         limit = max(1, min(2000, int(raw_limit)))
     except ValueError:
         limit = 200
-    return _api_call(lambda: service.read_log_file(name, offset=offset, limit=limit, level=level))
+    return await _blocking(lambda: _api_call(lambda: service.read_log_file(name, offset=offset, limit=limit, level=level)))
 
 
 async def _login_test(request: Request) -> Response:
     service = request.app.state.service
-    return _api_call(lambda: {"user": service.login_test()})
+    return await _blocking(lambda: _api_call(lambda: {"user": service.login_test()}))
 
 
 async def _search(request: Request) -> Response:
@@ -578,12 +656,12 @@ async def _search(request: Request) -> Response:
         limit = max(1, min(200, int(raw_limit)))
     except ValueError:
         limit = 50
-    return _api_call(lambda: {"results": service.search(keyword, limit=limit)})
+    return await _blocking(lambda: _api_call(lambda: {"results": service.search(keyword, limit=limit)}))
 
 
 async def _downloads(request: Request) -> Response:
     service = request.app.state.service
-    return _api_call(lambda: {"records": service.list_downloads()})
+    return await _blocking(lambda: _api_call(lambda: {"records": service.list_downloads()}))
 
 
 async def _start_download(request: Request) -> Response:
@@ -594,12 +672,14 @@ async def _start_download(request: Request) -> Response:
         return _error_response("item_id is required")
     override_dir = payload.get("override_dir")
     force_restart = bool(payload.get("force_restart", False))
-    return _api_call(
-        lambda: _ok(
-            service.start_download(
-                item_id,
-                force_restart=force_restart,
-                override_dir=Path(str(override_dir)) if override_dir else None,
+    return await _blocking(
+        lambda: _api_call(
+            lambda: _ok(
+                service.start_download(
+                    item_id,
+                    force_restart=force_restart,
+                    override_dir=Path(str(override_dir)) if override_dir else None,
+                )
             )
         )
     )
@@ -608,13 +688,13 @@ async def _start_download(request: Request) -> Response:
 async def _resume_download(request: Request) -> Response:
     service = request.app.state.service
     item_id = request.path_params["item_id"]
-    return _api_call(lambda: _ok(service.resume_record(item_id)))
+    return await _blocking(lambda: _api_call(lambda: _ok(service.resume_record(item_id))))
 
 
 async def _delete_download(request: Request) -> Response:
     service = request.app.state.service
     item_id = request.path_params["item_id"]
-    return _api_call(lambda: service.delete_record(item_id))
+    return await _blocking(lambda: _api_call(lambda: service.delete_record(item_id)))
 
 
 async def _pause(request: Request) -> Response:
@@ -654,13 +734,16 @@ async def _default_download_dir(request: Request) -> Response:
     if not path:
         return _error_response("path is required")
     persist = bool(payload.get("persist", False))
-    return _api_call(lambda: {"path": service.set_default_download_dir(Path(path), persist=persist)})
+    return await _blocking(lambda: _api_call(lambda: {"path": service.set_default_download_dir(Path(path), persist=persist)}))
 
 
 async def _json_body(request: Request) -> dict[str, Any]:
     if not request.headers.get("content-type", "").lower().startswith("application/json"):
         return {}
-    data = await request.json()
+    try:
+        data = await request.json()
+    except Exception:
+        raise ValueError("请求体不是合法 JSON")
     return data if isinstance(data, dict) else {}
 
 
@@ -672,14 +755,38 @@ def _api_call(func) -> Response:
     try:
         return JSONResponse(func())
     except Exception as exc:
-        return _error_response(str(exc))
+        logger.exception("API call failed")
+        # 应用级安全消息可回显；底层异常（网络/DB/路径）脱敏，避免信息泄漏
+        message = str(exc) if isinstance(exc, (RuntimeError, ValueError)) else "操作失败，请查看服务端日志"
+        return _error_response(message)
 
 
 def _error_response(message: str, status_code: int = 400) -> Response:
     return JSONResponse({"detail": message}, status_code=status_code)
 
 
-def create_web_app(service: AppService) -> Starlette:
+async def _value_error_handler(request: Request, exc: ValueError) -> Response:
+    return JSONResponse({"detail": str(exc)}, status_code=400)
+
+
+async def _unhandled_handler(request: Request, exc: Exception) -> Response:
+    logger.exception("Unhandled web error")
+    return JSONResponse({"detail": "服务器内部错误"}, status_code=500)
+
+
+def create_web_app(service: AppService, allowed_hosts=None, token: str | None = None) -> Starlette:
+    allowed = set(DEFAULT_ALLOWED_HOSTS)
+    if allowed_hosts:
+        allowed.update(_normalize_host(h) for h in allowed_hosts)
+    if token is None:
+        store_dir = service.config.database_path.parent if service.config is not None else Path("store")
+        store_dir.mkdir(parents=True, exist_ok=True)
+        token_file = store_dir / "web_token.txt"
+        if token_file.exists():
+            token = token_file.read_text(encoding="utf-8").strip()
+        else:
+            token = secrets.token_urlsafe(24)
+            token_file.write_text(token, encoding="utf-8")
     app = Starlette(
         routes=[
             Route("/", _index, methods=["GET"]),
@@ -699,7 +806,11 @@ def create_web_app(service: AppService) -> Starlette:
             Route("/api/control/cancel", _cancel, methods=["POST"]),
             Route("/api/control/segments", _set_segments, methods=["POST"]),
             Route("/api/default-download-dir", _default_download_dir, methods=["POST"]),
-        ]
+        ],
+        middleware=[Middleware(_SecurityMiddleware)],
+        exception_handlers={ValueError: _value_error_handler, Exception: _unhandled_handler},
     )
     app.state.service = service
+    app.state.web_token = token
+    app.state.allowed_hosts = allowed
     return app
