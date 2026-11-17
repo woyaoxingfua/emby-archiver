@@ -3,12 +3,14 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import re
+import shutil
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
+import requests
 from tqdm import tqdm
 
 from emby_client import EmbyClient, EmbyClientError
@@ -68,6 +70,9 @@ class Downloader:
         self._current_mode: str | None = None
         self._cancel_cleanup_temp = False
         self.last_result_status = "idle"
+        self._last_progress_db = 0.0
+        self._progress_db_interval = 1.0
+        self._current_expected: int | None = None
 
     def pause(self) -> None:
         """Signal the active download to pause."""
@@ -100,8 +105,15 @@ class Downloader:
         self.last_result_status = "idle"
 
     def download_many(self, items: Iterable[MediaItem]) -> None:
+        # N7：批量下载单集失败不再中止整批，记录错误后继续
         for item in items:
-            self.download_item(item)
+            try:
+                self.download_item(item)
+            except DownloadCancelled:
+                raise
+            except (DownloadError, EmbyClientError, OSError) as exc:
+                logger.error("Item failed, continuing batch: %s (%s)", item.name, exc)
+                continue
 
     def download_item(self, item: MediaItem, force_restart: bool = False) -> Path:
         self.reset_control_events()
@@ -284,10 +296,17 @@ class Downloader:
                     self.library.upsert(item, target_path, "downloading", resume_from, None, url, download_mode=current_mode)
                     self._emit("fallback", item, resume_from, None, target_path, str(exc))
                 except (DownloadError, EmbyClientError, OSError) as exc:
+                    # N2：分段已有进度时绝不清零回退——保留 .seg 断点，交给后续候选/下次续传
+                    if self._segment_files(temp_path):
+                        logger.warning("Multipart failed but segment progress exists; preserving .seg for resume: %s", exc)
+                        raise
                     current_mode = "单线程回退（分段失败）"
                     self.library.upsert(item, target_path, "downloading", resume_from, None, url, download_mode=current_mode)
                     self._emit("fallback", item, resume_from, None, target_path, f"分段下载失败，回退单线程：{exc}")
 
+        # N2：任何回退单线程的路径都不得清掉已有分段断点（含 MultipartUnavailable 分支）
+        if self._segment_files(temp_path):
+            raise DownloadError("存在分段断点，保留 .seg 进度，本候选不回退单线程")
         self._cleanup_segment_files(temp_path)
         resume_from = temp_path.stat().st_size if temp_path.exists() else 0
         if effective_segments <= 1:
@@ -307,23 +326,33 @@ class Downloader:
                     response.headers.get("Content-Length", "-"),
                     response.headers.get("Accept-Ranges", "-"))
 
-        if resume_from and response.status_code == 200:
-            self._emit(
-                "diagnostic",
-                item,
-                resume_from,
-                None,
-                target_path,
-                "续传请求返回 HTTP 200，服务端未接受续传，已自动从头重下",
-            )
-            logger.warning("Resume request returned HTTP 200 for %s, restarting from scratch", item.name)
+        def _restart_from_scratch(reason: str):
+            nonlocal resume_from, response
+            self._emit("diagnostic", item, resume_from, None, target_path, reason)
+            logger.warning("%s for %s, restarting from scratch", reason, item.name)
             temp_path.unlink(missing_ok=True)
             resume_from = 0
             response.close()
             response = self.client.open_stream(url, resume_from=0)
 
+        if resume_from and response.status_code == 200:
+            _restart_from_scratch("续传请求返回 HTTP 200，服务端未接受续传，已自动从头重下")
+        elif resume_from and response.status_code == 206:
+            # N4：校验 206 的 Content-Range 起始偏移必须等于续传点，否则追加会损坏文件
+            parsed = _parse_content_range(response.headers.get("Content-Range", ""))
+            if parsed is None or parsed[0] != resume_from:
+                _restart_from_scratch("续传返回的 Content-Range 起始偏移与断点不一致，已自动从头重下")
+
         expected_size = _expected_size(response, resume_from)
+        # N16（部分）：续传时服务端总大小与历史记录不一致 → 源已变更，从头重下
+        if resume_from and expected_size is not None:
+            prior = self.library.get(item.item_id)
+            if prior and prior.expected_size and prior.expected_size != expected_size:
+                _restart_from_scratch("服务端文件总大小与历史断点记录不一致（源可能已变更），已自动从头重下")
+                expected_size = _expected_size(response, resume_from)
+        self._current_expected = expected_size
         if expected_size is not None:
+            self._check_disk_space(target_path.parent, expected_size, resume_from, multipart=False)
             self.library.upsert(item, target_path, "downloading", resume_from, expected_size, url, download_mode=mode_detail)
         write_mode = "ab" if resume_from else "wb"
         use_tqdm = self.progress_callback is None
@@ -350,15 +379,7 @@ class Downloader:
                 handle.write(chunk)
                 progress_bar.update(len(chunk))
                 current = handle.tell()
-                self.library.upsert(
-                    item,
-                    target_path,
-                    "downloading",
-                    current,
-                    expected_size,
-                    url,
-                    download_mode=mode_detail,
-                )
+                self._maybe_upsert_progress(item, target_path, current, expected_size, url, mode_detail)
                 self._emit("progress", item, current, expected_size, target_path)
                 slow_probe_start, slow_probe_bytes = self._detect_slow_speed(
                     item, current, slow_probe_start, slow_probe_bytes, mode_detail
@@ -367,7 +388,7 @@ class Downloader:
         self._check_cancelled()
 
         final_size = temp_path.stat().st_size
-        if expected_size is not None and final_size < expected_size:
+        if expected_size is not None and final_size != expected_size:
             self.library.upsert(item, target_path, "partial", final_size, expected_size, url, download_mode=mode_detail)
             self._emit("partial", item, final_size, expected_size, target_path)
             raise DownloadError(
@@ -567,12 +588,13 @@ class Downloader:
             segment_specs.append((idx, start, end, seg_temp, seg_resume))
 
         self._current_mode = mode_detail
+        self._current_expected = total
         self.library.upsert(item, target_path, "downloading", downloaded_bytes, total, url, download_mode=mode_detail)
 
         def emit_progress() -> None:
             with lock:
                 current = downloaded_bytes
-            self.library.upsert(item, target_path, "downloading", current, total, url, download_mode=mode_detail)
+            self._maybe_upsert_progress(item, target_path, current, total, url, mode_detail)
             self._emit("progress", item, current, total, target_path)
 
         def download_segment(idx: int, start: int, end: int, seg_temp: Path, seg_resume: int) -> None:
@@ -581,53 +603,73 @@ class Downloader:
                 shutdown.set()
                 return
 
-            actual_start = start + seg_resume
-            if actual_start > end:
-                return
-
-            headers = {"Range": f"bytes={actual_start}-{end}"}
-            response = None
-            try:
-                response = self.client.session.get(
-                    url,
-                    headers=headers,
-                    stream=True,
-                    timeout=self.client.config.timeout,
-                    allow_redirects=True,
-                )
-                if response.status_code != 206:
-                    raise EmbyClientError(f"Segment {idx} HTTP {response.status_code}")
-                content_range = response.headers.get("Content-Range", "")
-                parsed = _parse_content_range(content_range)
-                if parsed is None:
-                    raise EmbyClientError(f"Segment {idx} 缺少合法 Content-Range")
-                returned_start, returned_end, returned_total = parsed
-                if (returned_start, returned_end) != (actual_start, end) or returned_total != total:
-                    raise EmbyClientError(f"Segment {idx} Content-Range mismatch: {content_range}")
-                with seg_temp.open("ab") as handle:
-                    for chunk in response.iter_content(chunk_size=self.client.config.chunk_size):
-                        self._check_cancelled()
-                        if shutdown.is_set():
-                            break
-                        # Pause handling is coarse for multi-part: stop reading and
-                        # block until resumed, but keep the HTTP response open.
-                        while self.pause_event.is_set() and not self.cancel_event.is_set():
-                            time.sleep(0.2)
-                        if not chunk:
-                            continue
-                        handle.write(chunk)
+            max_attempts = 3
+            attempts = 0
+            while True:
+                if shutdown.is_set() or self.cancel_event.is_set():
+                    return
+                # 每次重试都从 seg 文件当前大小续传，保留已下字节
+                current_size = seg_temp.stat().st_size if seg_temp.exists() else 0
+                actual_start = start + current_size
+                if actual_start > end:
+                    return
+                headers = {"Range": f"bytes={actual_start}-{end}"}
+                response = None
+                try:
+                    response = self.client.session.get(
+                        url,
+                        headers=headers,
+                        stream=True,
+                        timeout=self.client.config.timeout,
+                        allow_redirects=True,
+                    )
+                    if response.status_code != 206:
+                        raise EmbyClientError(f"Segment {idx} HTTP {response.status_code}")
+                    content_range = response.headers.get("Content-Range", "")
+                    parsed = _parse_content_range(content_range)
+                    if parsed is None:
+                        raise EmbyClientError(f"Segment {idx} 缺少合法 Content-Range")
+                    returned_start, returned_end, returned_total = parsed
+                    if (returned_start, returned_end) != (actual_start, end) or returned_total != total:
+                        raise EmbyClientError(f"Segment {idx} Content-Range mismatch: {content_range}")
+                    with seg_temp.open("ab") as handle:
+                        for chunk in response.iter_content(chunk_size=self.client.config.chunk_size):
+                            self._check_cancelled()
+                            if shutdown.is_set():
+                                break
+                            # N20：暂停循环同时检查 shutdown，避免失败任务卡死在暂停里
+                            while self.pause_event.is_set() and not self.cancel_event.is_set() and not shutdown.is_set():
+                                time.sleep(0.2)
+                            if self.cancel_event.is_set():
+                                raise DownloadCancelled("用户取消下载")
+                            if not chunk:
+                                continue
+                            handle.write(chunk)
+                            with lock:
+                                downloaded_bytes += len(chunk)
+                            emit_progress()
+                    return  # 本段完成
+                except DownloadCancelled:
+                    shutdown.set()
+                    return
+                except (requests.RequestException, EmbyClientError, OSError) as exc:
+                    # N11：段级指数退避重试，单次网络抖动不再废掉整个任务
+                    attempts += 1
+                    if attempts >= max_attempts or shutdown.is_set():
                         with lock:
-                            downloaded_bytes += len(chunk)
-                        emit_progress()
-            except DownloadCancelled:
-                shutdown.set()
-            except Exception as exc:
-                with lock:
-                    errors.append(exc)
-                shutdown.set()
-            finally:
-                if response is not None:
-                    response.close()
+                            errors.append(exc)
+                        shutdown.set()
+                        return
+                    backoff = min(8.0, 0.5 * (2 ** (attempts - 1)))
+                    logger.warning("Segment %s attempt %s failed (%s); retry in %.1fs", idx, attempts, exc, backoff)
+                    deadline = time.monotonic() + backoff
+                    while time.monotonic() < deadline:
+                        if shutdown.is_set() or self.cancel_event.is_set():
+                            return
+                        time.sleep(0.1)
+                finally:
+                    if response is not None:
+                        response.close()
 
         self._emit("mode", item, downloaded_bytes, total, target_path, mode_detail)
         if downloaded_bytes:
@@ -680,7 +722,37 @@ class Downloader:
             seg_path.unlink(missing_ok=True)
 
     def _segment_files(self, temp_path: Path) -> list[Path]:
-        return sorted(temp_path.parent.glob(f"{temp_path.name}.seg*"))
+        # N9：用 iterdir+startswith 替代 glob，避免标题中的 [ ] 等元字符导致匹配失败
+        prefix = temp_path.name + ".seg"
+        parent = temp_path.parent
+        if not parent.exists():
+            return []
+        return sorted(p for p in parent.iterdir() if p.is_file() and p.name.startswith(prefix))
+
+    def _maybe_upsert_progress(self, item, target_path, downloaded, expected, url, mode, force=False):
+        # N10：进度写库节流（≥1s），并把 DB 异常与下载解耦——写库失败只告警，不杀任务
+        now = time.monotonic()
+        if not force and now - self._last_progress_db < self._progress_db_interval:
+            return
+        self._last_progress_db = now
+        try:
+            self.library.upsert(item, target_path, "downloading", downloaded, expected, url, download_mode=mode)
+        except Exception as exc:
+            logger.warning("Progress DB write failed (non-fatal): %s", exc)
+
+    def _check_disk_space(self, folder: Path, expected_size: int, resume_from: int, multipart: bool):
+        # N11：下载前磁盘空间预检；合并架构需要约 2× 剩余空间
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            free = shutil.disk_usage(folder).free
+        except OSError:
+            return
+        remaining = max(0, expected_size - resume_from)
+        required = remaining * 2 if multipart else remaining
+        if free < required:
+            raise DownloadError(
+                f"磁盘空间不足：需要约 {required} 字节，剩余 {free} 字节（目录 {folder}）"
+            )
 
     def _effective_segments_for_candidate(self, candidate_name: str) -> int:
         if candidate_name.startswith("Videos/stream"):
@@ -706,7 +778,7 @@ class Downloader:
             target_path,
             "paused",
             paused_bytes,
-            None,
+            self._current_expected,
             self._current_url,
             download_mode=self._current_mode or "已暂停",
         )
@@ -721,7 +793,7 @@ class Downloader:
             target_path,
             "downloading",
             paused_bytes,
-            None,
+            self._current_expected,
             self._current_url,
             download_mode=self._current_mode or "继续下载",
         )
@@ -766,17 +838,23 @@ class Downloader:
 
         if item.type == "Movie":
             title = _sanitize(_movie_title(item))
-            return base_dir / title / f"{title}{ext}"
-
-        if item.type == "Episode":
+            path = base_dir / title / f"{title}{ext}"
+        elif item.type == "Episode":
             series = _sanitize(item.series_name or "Unknown Series")
             season_no = item.parent_index_number or 0
             episode_no = item.episode_number or 0
             season_dir = f"Season {season_no:02d}"
             filename = f"S{season_no:02d}E{episode_no:02d} - {_sanitize(item.name)}{ext}"
-            return base_dir / series / season_dir / filename
+            path = base_dir / series / season_dir / filename
+        else:
+            path = base_dir / f"{_sanitize(item.name)}{ext}"
 
-        return base_dir / f"{_sanitize(item.name)}{ext}"
+        # N1：强制目标路径必须落在下载目录内，封死服务端可控 container/name 的路径穿越
+        base_resolved = base_dir.resolve()
+        resolved = path.resolve()
+        if not resolved.is_relative_to(base_resolved):
+            raise DownloadError(f"已拒绝不安全的下载路径（超出下载目录）：{item.name}")
+        return resolved
 
     def _emit(
         self,
@@ -849,19 +927,48 @@ def _movie_title(item: MediaItem) -> str:
     return f"{item.name} ({item.year})" if item.year else item.name
 
 
+_WINDOWS_RESERVED = {
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
 def _sanitize(text: str) -> str:
-    cleaned = INVALID_CHARS.sub("_", text).strip().rstrip(".")
+    # N18：控制字符替换 + 去首尾空白 + 去尾部点/空格 + 长度截断 + Windows 保留名加后缀
+    cleaned = INVALID_CHARS.sub("_", text).strip()
+    cleaned = cleaned.rstrip(". ").strip()
+    if len(cleaned) > 200:
+        cleaned = cleaned[:200].rstrip(". ").strip()
+    if cleaned.upper() in _WINDOWS_RESERVED:
+        cleaned += "_"
     return cleaned or "untitled"
 
 
+_EXT_WHITELIST = {
+    "mp4": "mp4", "m4v": "mp4", "mov": "mp4", "f4v": "mp4",
+    "mkv": "mkv", "matroska": "mkv", "webm": "webm",
+    "avi": "avi", "divx": "avi", "xvid": "avi",
+    "flv": "flv", "wmv": "wmv", "asf": "asf",
+    "ts": "ts", "m2ts": "ts", "mts": "ts", "mpg": "mpg", "mpeg": "mpg",
+    "3gp": "3gp", "3g2": "3gp", "ogv": "ogv", "vob": "vob",
+    "rm": "rm", "rmvb": "rmvb", "iso": "iso",
+}
+
+
 def _safe_ext(container: str | None) -> str:
+    # N1/N18：只保留字母数字后查白名单映射，未知容器落 .bin——封死路径注入并修正 matroska/mov 映射
     if not container:
         return "mp4"
-    ext = container.split(",", 1)[0].strip().lower()
-    return ext or "mp4"
+    first = re.sub(r"[^a-z0-9]", "", container.split(",", 1)[0].strip().lower())
+    return _EXT_WHITELIST.get(first, "bin")
 
 
 def _expected_size(response, resume_from: int) -> int | None:
+    encoding = response.headers.get("Content-Encoding", "").strip().lower()
+    if encoding and encoding != "identity":
+        # 透明解压（gzip 等）会让 Content-Length 与实际落盘字节不一致，放弃尺寸校验
+        return None
     content_range = response.headers.get("Content-Range", "")
     parsed = _parse_content_range(content_range)
     if parsed is not None:
@@ -889,4 +996,7 @@ def _parse_content_range(header: str) -> tuple[int, int, int] | None:
     total_text = total_part.strip()
     if not (start_text.isdigit() and end_text.isdigit() and total_text.isdigit()):
         return None
-    return int(start_text), int(end_text), int(total_text)
+    start, end, total = int(start_text), int(end_text), int(total_text)
+    if start > end or end >= total:
+        return None
+    return start, end, total
