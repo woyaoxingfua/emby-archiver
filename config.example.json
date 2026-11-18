@@ -28,5 +28,6 @@
   "rate_limit_kbps": 0,
   "job_history_limit": 200,
   "flush_interval_seconds": 0.0,
+  "download_subtitles": true,
   "web_allowed_hosts": []
 }

@@ -76,7 +76,7 @@ py -3.12 -m venv .venv
 本机 Windows 实机已运行完整测试（2026-11-19 更新，HEAD 详见 Git log）：
 
 ```text
-104 passed in 71.83s（历史基线：84 passed, 1 warning in 57.79s）
+109 passed in 75.33s（历史基线：84 passed, 1 warning in 57.79s）
 ```
 
 曾有的唯一警告（Starlette TestClient/httpx 弃用提示）已通过安装 httpx2 消除（见 §8 P3）；不要通过删除测试、吞掉警告或放宽断言来“修复”任何回归。
@@ -217,7 +217,9 @@ py -3.12 -m venv .venv
 ### P2：持久任务队列（只有用户需要时）
 
 先设计数据库系统记录源、启动对账、重复入队、取消、崩溃恢复、批次状态与旧版本兼容，再编码。不要简单把当前内存队列序列化就宣称可靠恢复。
-入队判重（DupeCheck，2026-11-19 已实现一部分）：历史中已 completed 的条目入队时直接跳过并入队响应显式报告（`queued/skipped_completed/batch_id`）；`force_restart` 语义优先；全部已缓存时不创建空批次。回归 `tests/test_enqueue_dedupe.py`。此改动源自 Sonarr/SABnzbd/NZBGet 竞品调研；调研还识别出「事件型历史、统一通知钩子、外挂字幕随行、缓存容量滚动清理、磁盘空间护栏」等待选特性，详见聊天记录或按需重调研。
+入队判重（DupeCheck，2026-11-19 已实现一部分）：历史中已 completed 的条目入队时直接跳过并入队响应显式报告（`queued/skipped_completed/batch_id`）；`force_restart` 语义优先；全部已缓存时不创建空批次。回归 `tests/test_enqueue_dedupe.py`。此改动源自 Sonarr/SABnzbd/NZBGet 竞品调研；调研还识别出「事件型历史、统一通知钩子、外挂字幕随行、缓存容量滚动清理、磁盘空间护栏」等待选特性。
+
+字幕随行（2026-11-19 已实现）：`download_subtitles`（默认 true）——主文件完成后拉取 MediaStreams 中 IsExternal 文本字幕，存为 `<视频名>.<语言>.srt`（Emby 官方下载行为）；失败仅诊断不阻断主文件。`emby_client.get_external_subtitles`、mock `add_subtitle`。回归 `tests/test_subtitle_download.py`。未验证真实 Emby 的 DeliveryUrl 变体与 ass/vtt 编码（mock 只验证 subrip/srt）。
 
 ### P2：真实 GUI/Web 交互验收
 

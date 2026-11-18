@@ -159,6 +159,41 @@ class EmbyClient:
         )
         return self._to_media_item(response.json())
 
+    def get_external_subtitles(self, item_id: str) -> list[dict[str, str]]:
+        """返回条目的外挂字幕清单：[{"index": str, "url": str, "language": str}]。
+
+        只取 MediaStreams 中 Type=Subtitle 且 IsExternal 的流；url 优先用服务端
+        提供的 DeliveryUrl（相对路径拼上 api_key），否则按官方约定构造
+        /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/Stream.srt。
+        内嵌字幕（IsExternal=false）不返回——离线播放器读不到容器内字幕流。
+        """
+        self._ensure_user_id()
+        detail = self._request(
+            "GET",
+            f"/Users/{self.user_id}/Items/{item_id}",
+            params={"Fields": "MediaSources"},
+        ).json()
+        results: list[dict[str, str]] = []
+        for source in detail.get("MediaSources") or []:
+            for stream in source.get("MediaStreams") or []:
+                if stream.get("Type") != "Subtitle" or not stream.get("IsExternal"):
+                    continue
+                index = str(stream.get("Index"))
+                delivery = str(stream.get("DeliveryUrl") or "")
+                if delivery:
+                    url = self.authorized_url(delivery)
+                else:
+                    media_source_id = str(source.get("Id") or "")
+                    url = self.authorized_url(
+                        f"/Videos/{item_id}/{media_source_id}/Subtitles/{index}/Stream.srt"
+                    )
+                results.append({
+                    "index": index,
+                    "url": url,
+                    "language": str(stream.get("Language") or stream.get("DisplayTitle") or "und"),
+                })
+        return results
+
     def get_children(self, parent_id: str) -> list[MediaItem]:
         self._ensure_user_id()
         response = self._request(

@@ -32,6 +32,7 @@ class MockEmby:
         self.details: dict[str, dict] = {}
         self.files: dict[str, bytes] = {}
         self.behavior: dict[str, dict] = {}
+        self.subtitle_files: dict[tuple[str, int], bytes] = {}
         self.auth_password = "goodpass"
         self.token = "mock-token-SECRET-123"
         self.user_id = "u1"
@@ -103,6 +104,27 @@ class MockEmby:
         }
         self.files[item_id] = make_payload(size)
         self.behavior[item_id] = behavior
+
+    def add_subtitle(self, item_id: str, stream_index: int, language: str = "chi",
+                     content: str | None = None) -> None:
+        """为已注册条目添加一条外挂字幕（MediaStreams[Type=Subtitle, IsExternal]）。"""
+        detail = self.details.get(item_id)
+        if detail is None:
+            raise KeyError(f"item {item_id} not registered before add_subtitle")
+        media_source = detail["MediaSources"][0]
+        streams = media_source.setdefault("MediaStreams", [])
+        streams.append({
+            "Index": stream_index,
+            "Type": "Subtitle",
+            "IsExternal": True,
+            "Codec": "subrip",
+            "Language": language,
+            "DisplayTitle": f"{language} (External)",
+            "DeliveryUrl": f"/Videos/{item_id}/{media_source['Id']}/Subtitles/{stream_index}/Stream.srt",
+        })
+        self.subtitle_files[(item_id, stream_index)] = (
+            content if content is not None else f"1\n00:00:01,000 --> 00:00:02,000\nsubtitle-{item_id}\n"
+        ).encode("utf-8")
 
     # ---------- 请求处理 ----------
     def _authorized(self, h: BaseHTTPRequestHandler, qs: dict) -> bool:
@@ -190,6 +212,19 @@ class MockEmby:
         m = re.fullmatch(r"/Videos/([^/]+)/stream\.[^/]+", path)
         if m:
             self._send_file(h, m.group(1))
+            return
+        # 外挂字幕流：/Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/Stream.srt
+        m = re.fullmatch(r"/Videos/([^/]+)/[^/]+/Subtitles/(\d+)/Stream\.[^/]+", path)
+        if m:
+            data = self.subtitle_files.get((m.group(1), int(m.group(2))))
+            if data is None:
+                self._json(h, {"Message": "no such subtitle"}, 404)
+                return
+            h.send_response(200)
+            h.send_header("Content-Type", "application/x-subrip")
+            h.send_header("Content-Length", str(len(data)))
+            h.end_headers()
+            h.wfile.write(data)
             return
         self._json(h, {"Message": "not found"}, 404)
 

@@ -233,6 +233,7 @@ class Downloader:
                         candidate_name,
                     )
                     self.last_result_status = "completed"
+                    self._download_subtitles(item, target_path)
                     return result
                 except DownloadCancelled:
                     final_status = "cancelled" if self._cancel_cleanup_temp else "paused"
@@ -1223,6 +1224,43 @@ class Downloader:
             end = (start + seg_size - 1) if idx < num_segments - 1 else (total - 1)
             plans.append((idx, start, end))
         return plans
+
+    def _download_subtitles(self, item: MediaItem, target_path: Path) -> None:
+        """主文件完成后下载外挂字幕（增强，不参与成败判定）。
+
+        Emby 官方下载行为：文本外挂字幕随行保存，离线时播放器可自动加载。
+        任何失败（网络/404/写盘）只记日志与诊断事件，不影响主文件 completed 状态。
+        命名与主流播放器约定一致：<视频名>.<语言>.srt 放在视频同目录。
+        """
+        if not self.client.config.download_subtitles:
+            return
+        try:
+            subtitles = self.client.get_external_subtitles(item.item_id)
+        except EmbyClientError as exc:
+            logger.warning("Subtitle listing failed for %s: %s", item.name, exc)
+            return
+        for subtitle in subtitles:
+            dest = target_path.with_name(f"{target_path.stem}.{subtitle['language']}.srt")
+            try:
+                response = self.client.session.get(
+                    subtitle["url"],
+                    timeout=self.client.config.timeout,
+                    allow_redirects=True,
+                )
+                if response.status_code != 200:
+                    raise EmbyClientError(f"HTTP {response.status_code}")
+                dest.write_bytes(response.content)
+                logger.info("Subtitle saved: %s -> %s", item.name, dest)
+            except (requests.RequestException, EmbyClientError, OSError) as exc:
+                logger.warning("Subtitle download failed for %s (%s): %s", item.name, dest.name, exc)
+                self._emit(
+                    "diagnostic",
+                    item,
+                    0,
+                    None,
+                    target_path,
+                    f"外挂字幕下载失败：{dest.name}（{exc}）",
+                )
 
     def _cleanup_segment_files(self, temp_path: Path) -> None:
         for seg_path in self._segment_files(temp_path):

@@ -36,6 +36,7 @@ class AppConfig:
     rate_limit_kbps: int = 0
     job_history_limit: int = 200
     flush_interval_seconds: float = 0.0
+    download_subtitles: bool = True
 
 
 @dataclass(slots=True)
