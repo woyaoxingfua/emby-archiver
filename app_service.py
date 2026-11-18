@@ -525,11 +525,34 @@ class AppService:
                 job.result = "cancelled"
             self._record_log(f"已取消：{job.item.name}")
         except (DownloadError, EmbyClientError, OSError) as exc:
+            disk_gated = "磁盘空间不足" in str(exc)
             with self._state_lock:
                 job.status = "failed"
                 job.result = "failed"
                 job.error = str(exc)
+                cancelled_for_disk: list[_DownloadJob] = []
+                if disk_gated:
+                    # 磁盘护栏：后续 queued 任务会以同样的方式失败，全部显式
+                    # 取消并保留断点，避免队列逐个空转烧请求。
+                    for other in self._jobs.values():
+                        if other.status == "queued":
+                            other.status = "cancelled"
+                            other.result = "cancelled"
+                            other.finished_at = time.time()
+                            other.error = "因磁盘空间不足自动取消，清理空间后可重新下载"
+                            cancelled_for_disk.append(other)
             self._record_log(f"下载失败：{job.item.name}（{exc}）")
+            if disk_gated:
+                self._record_log(
+                    f"磁盘空间不足：已自动取消 {len(cancelled_for_disk)} 个排队任务；"
+                    "清理磁盘空间后可重新发起下载（已完成进度保留在断点中）"
+                )
+                for other in cancelled_for_disk:
+                    self._finish_job(other)
+                    other.done.set()
+                if cancelled_for_disk:
+                    with self._state_lock:
+                        self._prune_history_locked()
         except Exception as exc:
             with self._state_lock:
                 job.status = "failed"
