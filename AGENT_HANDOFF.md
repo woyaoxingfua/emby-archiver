@@ -192,6 +192,7 @@ py -3.12 -m venv .venv
 - 本机 Windows 已通过 Mock Emby 测试，但尚未对真实 Emby 在线验证认证、Range、ETag、候选切换和播放流行为。
 - 取消恢复已验证；真实断电、操作系统级崩溃和文件系统掉电语义未实测。
 - 每批刷盘及原子更新元数据会增加 I/O；尚无不同硬件上的性能 benchmark。
+  - 2026-11-19 更新：`flush_interval_seconds`（默认 0=旧行为每 chunk 刷盘）已实现节流批量刷盘，暂停/取消/段尾/请求失败一律强制精确落盘；元数据 received 只在字节 fsync 后更新（永不超前数据）。本机基准（8MB×4段×64KB chunk，Mock Emby）：0s=21.1MB/s、250 次 fsync；0.5s=92.9MB/s、10 次 fsync（吞吐 4.4 倍）；恢复精度两模式均字节精确。基准在 `tests/bench_multipart_perf.py`（随全套件运行），回归在 `tests/test_flush_throttle.py`。节流开启时硬崩溃后至多重传 flush_interval 秒带宽量/段；真实断电语义仍未实测。
 - GUI 主要验证任务/加载逻辑，未做完整真实桌面点击交互。
 - Web 队列不是持久队列，重启后的排队任务恢复未实现。
 - 旧 `.seg` 兼容路径仍需要一次合并。
@@ -207,7 +208,7 @@ py -3.12 -m venv .venv
 
 ### P1：预分配引擎性能测量
 
-分别测量吞吐、磁盘写入量、元数据更新频率和进度恢复精度，再决定是否批量刷盘/合并元数据更新。任何降低 `fsync` 频率的改动都必须重新分析崩溃窗口，不能只追求 benchmark 数字。
+已完成（2026-11-19）：基准 + 节流实现一体落地。测量见 §7 更新条目（8MB/4段：0s 21.1MB/s 250 次 fsync → 0.5s 92.9MB/s 10 次 fsync）。默认保持 0（旧行为），用户可按磁盘能力在 config.json 开启 `flush_interval_seconds`。本机 Windows 全套 95 passed（90 基线 + 节流回归 5 + 基准 5）。若未来改默认值，先跑 `tests/bench_multipart_perf.py -s` 在目标硬件复测，并重审崩溃窗口语义。
 
 ### P1：长运行历史清理
 

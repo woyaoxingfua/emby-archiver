@@ -35,6 +35,7 @@ class AppConfig:
     slow_window_seconds: float = 30.0
     rate_limit_kbps: int = 0
     job_history_limit: int = 200
+    flush_interval_seconds: float = 0.0
 
 
 @dataclass(slots=True)

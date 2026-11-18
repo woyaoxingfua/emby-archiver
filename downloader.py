@@ -827,9 +827,11 @@ class Downloader:
             clear_etag=source_etag is None,
         )
 
-        def emit_progress() -> None:
+        def emit_progress(extra: int = 0) -> None:
+            # extra = 已写入但尚未计入 received 的内存字节（节流期间），仅影响展示与节流库写；
+            # 断点恢复永远以 .part.meta.json 的 received 为准。
             with state_lock:
-                current = sum(segment["received"] for segment in state["segments"])
+                current = sum(segment["received"] for segment in state["segments"]) + extra
             self._maybe_upsert_progress(item, target_path, current, total, url, mode_detail)
             self._emit("progress", item, current, total, target_path)
 
@@ -838,6 +840,7 @@ class Downloader:
             start = segment["start"]
             end = segment["end"]
             max_attempts = max(1, self.client.config.retry_attempts)
+            flush_interval = max(0.0, self.client.config.flush_interval_seconds)
             attempts = 0
             while True:
                 if shutdown.is_set() or self.cancel_event.is_set():
@@ -851,6 +854,35 @@ class Downloader:
                 if source_etag:
                     headers["If-Range"] = source_etag
                 response = None
+                # 节流期间的已写字节数与上次刷盘时刻；flush_pending 幂等（pending=0 时无操作）。
+                # 正确性不变量：meta 的 received 只在对应字节 flush+fsync 之后更新，
+                # 元数据永不超前已刷盘数据——崩溃时只重传，绝不混拼旧/新字节。
+                pending = 0
+                last_flush = time.monotonic()
+
+                def flush_pending(output, *, forced: bool = True) -> None:
+                    """把本段自上次刷盘以来的字节落盘并原子更新元数据。
+
+                    forced=False 时仅当节流间隔到期才真正执行；所有非正常路径
+                    （暂停/取消/段结束/请求失败/暂停重开）都必须 forced=True 精确落盘。
+                    """
+                    nonlocal pending, last_flush
+                    if pending <= 0:
+                        return
+                    if not forced:
+                        if flush_interval <= 0:
+                            # flush_interval=0 保持旧行为：每 chunk 刷盘由调用方直接执行
+                            return
+                        if time.monotonic() - last_flush < flush_interval:
+                            return
+                    output.flush()
+                    os.fsync(output.fileno())
+                    with state_lock:
+                        segment["received"] += pending
+                        self._write_multipart_metadata(meta_path, state)
+                    pending = 0
+                    last_flush = time.monotonic()
+
                 try:
                     response = self.client.session.get(
                         url,
@@ -873,6 +905,7 @@ class Downloader:
                             if shutdown.is_set():
                                 break
                             if self.pause_event.is_set():
+                                flush_pending(output)  # 暂停前精确落盘
                                 response.close()
                                 while self.pause_event.is_set() and not self.cancel_event.is_set() and not shutdown.is_set():
                                     time.sleep(0.2)
@@ -887,15 +920,23 @@ class Downloader:
                                 raise EmbyClientError(f"Segment {idx} 返回字节超过请求区间")
                             self._limiter.acquire(len(chunk))
                             output.write(chunk)
-                            output.flush()
-                            os.fsync(output.fileno())
                             actual_start += len(chunk)
-                            with state_lock:
-                                segment["received"] += len(chunk)
-                                self._write_multipart_metadata(meta_path, state)
-                            emit_progress()
+                            if flush_interval <= 0:
+                                # 旧行为：每 chunk 落盘并原子更新元数据
+                                output.flush()
+                                os.fsync(output.fileno())
+                                with state_lock:
+                                    segment["received"] += len(chunk)
+                                    self._write_multipart_metadata(meta_path, state)
+                            else:
+                                pending += len(chunk)
+                                flush_pending(output, forced=False)
+                            emit_progress(pending)
+                        flush_pending(output)  # 段内数据收尾：精确落盘
                     return
                 except _PauseRestart:
+                    # 暂停重开走 continue；pending 归零由 finally 对新句柄重新初始化保证，
+                    # 暂停前那次 flush_pending 已把字节计入 received。
                     continue
                 except DownloadCancelled:
                     shutdown.set()
