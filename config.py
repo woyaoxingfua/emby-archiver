@@ -62,6 +62,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
         slow_threshold_kbps=max(0.0, float(raw.get("slow_threshold_kbps", 50))),
         slow_window_seconds=max(1.0, float(raw.get("slow_window_seconds", 30))),
         rate_limit_kbps=max(0, int(raw.get("rate_limit_kbps", 0))),
+        job_history_limit=max(0, int(raw.get("job_history_limit", 200))),
     )
 
     cfg.download_dir.mkdir(parents=True, exist_ok=True)

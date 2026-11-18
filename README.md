@@ -249,6 +249,7 @@ Web 模式默认**仅监听 `127.0.0.1`**，并自 v0.2 起启用访问令牌鉴
   "slow_threshold_kbps": 50.0,
   "slow_window_seconds": 30.0,
   "rate_limit_kbps": 0,
+  "job_history_limit": 200,
   "web_allowed_hosts": []
 }
 ```
@@ -275,6 +276,7 @@ Web 模式默认**仅监听 `127.0.0.1`**，并自 v0.2 起启用访问令牌鉴
 | `retry_backoff_base` / `retry_backoff_max` | 重试指数退避基数/上限（秒），默认 0.5 / 8.0 |
 | `slow_threshold_kbps` / `slow_window_seconds` | 慢速诊断阈值（KB/s）与观测窗口（秒），默认 50 / 30 |
 | `rate_limit_kbps` | 全局下载限速（KB/s），`0` 为不限速；单/多线程共享带宽上限 |
+| `job_history_limit` | Web 队列保留的终态任务条数上限，默认 200；超出时清理最早的已完成/失败/取消任务及其批次计数与条目锁，活动任务与磁盘下载记录不受影响；`0` 为不清理 |
 | `web_allowed_hosts` | Web Host 白名单额外允许的主机名/IP 列表（远程访问时填写），默认 `[]` |
 
 ---

@@ -85,6 +85,10 @@ class _DownloadJob:
     done: threading.Event = field(default_factory=threading.Event, repr=False)
 
 
+# 终态判定与 tests/test_download_queue.py 的 TERMINAL 集合保持一致（skipped 体现在 result 字段）
+_TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "cancelled"})
+
+
 class AppService:
     def __init__(self) -> None:
         self.config_path = Path("config.json")
@@ -410,6 +414,7 @@ class AppService:
             for job in jobs:
                 self._jobs[job.job_id] = job
                 self._job_queue.put(job.job_id)
+            self._prune_history_locked()
             self._reconcile_workers_locked()
         self._record_log(f"已加入下载队列：{len(jobs)} 个任务，worker 并发 {self.config.download_workers}")
         if force_restart:
@@ -445,8 +450,8 @@ class AppService:
                 return
             try:
                 with self._state_lock:
-                    job = self._jobs[job_id]
-                    if job.status == "cancelled":
+                    job = self._jobs.get(job_id)
+                    if job is None or job.status == "cancelled":
                         continue
                     job.status = "running"
                     job.started_at = time.time()
@@ -513,6 +518,9 @@ class AppService:
                 job.updated_at = job.finished_at
             self._finish_job(job)
             job.done.set()
+            # done 置位后补一次清理：本 job 自此刻起才满足可安全移除的条件
+            with self._state_lock:
+                self._prune_history_locked()
             self._notify_status()
 
     def _download_progress_for_job(self, job_id: str, *args: Any) -> None:
@@ -534,11 +542,52 @@ class AppService:
                 batch[result_key] += 1
             if batch["finished"] == batch["total"]:
                 summary = dict(batch)
+            self._prune_history_locked()
         if summary is not None:
             self._record_log(
                 f"批量下载完成：成功 {summary['ok']} / 失败 {summary['failed']} / "
                 f"跳过 {summary['skipped']} / 取消 {summary['cancelled']}，共 {summary['total']} 项"
             )
+
+    def _prune_history_locked(self) -> None:
+        """在 _state_lock 内清理终态历史，保证长运行内存有界。
+
+        三条不变量：
+        1. 仅移除终态（completed/failed/cancelled）且 done 事件已置位的 job；
+           done.set() 在 _finish_job 之后，故计数与批次汇总日志必然已完成，
+           也不会破坏 delete_record/cancel_current 锁外等待 done 的协议。
+        2. 批次在「全部任务已计入（finished==total）」或「_jobs 中不再有任何
+           引用该批次的 job」时移除（后者覆盖 result=None 悬空计数情形；
+           _finish_job 是 _batches 的唯一读取者，对已移除批次安全 no-op）。
+        3. 仅当该 item_id 已无 queued/running job 时移除 _item_locks 条目；
+           with item_lock 块在状态变终态前必然已退出，删除终态条目对应的锁对象安全。
+        job_history_limit=0 表示不清理（保留旧行为）。
+        """
+        assert self.config is not None
+        limit = self.config.job_history_limit
+        if limit <= 0:
+            return
+        terminal_jobs = [
+            job for job in self._jobs.values()
+            if job.status in _TERMINAL_JOB_STATUSES and job.done.is_set()
+        ]
+        if len(terminal_jobs) > limit:
+            terminal_jobs.sort(key=lambda job: job.created_at)
+            for job in terminal_jobs[: len(terminal_jobs) - limit]:
+                self._jobs.pop(job.job_id, None)
+        # 已全部计入或已无 job 引用的批次随之移除，避免 _batches 无界增长
+        referenced_batches = {job.batch_id for job in self._jobs.values()}
+        for batch_id, batch in list(self._batches.items()):
+            if batch["finished"] == batch["total"] or batch_id not in referenced_batches:
+                del self._batches[batch_id]
+        # 已无活动 job 的条目锁随之移除；新建 job 时 setdefault 会按需重建
+        active_item_ids = {
+            job.item.item_id for job in self._jobs.values()
+            if job.status in {"queued", "running"}
+        }
+        for item_id in list(self._item_locks):
+            if item_id not in active_item_ids:
+                del self._item_locks[item_id]
 
     def pause_current(self) -> None:
         self.ensure_ready()
@@ -578,6 +627,9 @@ class AppService:
         for job in cancelled_queued:
             self._finish_job(job)
             job.done.set()
+        if cancelled_queued:
+            with self._state_lock:
+                self._prune_history_locked()
         for downloader in targets:
             downloader.cancel(cleanup_temp=cleanup_temp)
         self._record_log(
@@ -612,6 +664,9 @@ class AppService:
         for job in queued_jobs:
             self._finish_job(job)
             job.done.set()
+        if queued_jobs:
+            with self._state_lock:
+                self._prune_history_locked()
         for job in running_jobs:
             if job.downloader is not None:
                 job.downloader.cancel(cleanup_temp=True)

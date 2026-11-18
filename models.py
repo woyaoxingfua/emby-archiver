@@ -34,6 +34,7 @@ class AppConfig:
     slow_threshold_kbps: float = 50.0
     slow_window_seconds: float = 30.0
     rate_limit_kbps: int = 0
+    job_history_limit: int = 200
 
 
 @dataclass(slots=True)
