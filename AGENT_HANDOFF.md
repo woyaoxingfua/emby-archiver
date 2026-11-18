@@ -76,7 +76,7 @@ py -3.12 -m venv .venv
 本机 Windows 实机已运行完整测试（2026-11-19 更新，HEAD 详见 Git log）：
 
 ```text
-112 passed in 76.02s（历史基线：84 passed, 1 warning in 57.79s）
+118 passed in 76.51s（历史基线：84 passed, 1 warning in 57.79s）
 ```
 
 曾有的唯一警告（Starlette TestClient/httpx 弃用提示）已通过安装 httpx2 消除（见 §8 P3）；不要通过删除测试、吞掉警告或放宽断言来“修复”任何回归。
@@ -222,6 +222,8 @@ py -3.12 -m venv .venv
 字幕随行（2026-11-19 已实现）：`download_subtitles`（默认 true）——主文件完成后拉取 MediaStreams 中 IsExternal 文本字幕，存为 `<视频名>.<语言>.srt`（Emby 官方下载行为）；失败仅诊断不阻断主文件。`emby_client.get_external_subtitles`、mock `add_subtitle`。回归 `tests/test_subtitle_download.py`。未验证真实 Emby 的 DeliveryUrl 变体与 ass/vtt 编码（mock 只验证 subrip/srt）。
 
 磁盘空间护栏（2026-11-19 已实现，队列级）：`_run_job` 捕获含「磁盘空间不足」的失败 → queued 任务全部自动 cancelled 并附说明、记全局日志（断点保留，清理空间后可重下）；普通错误不触发。回归 `tests/test_disk_guard.py`。入门限阈值配置（如 min_free_disk_gb）尚未做，当前以 Downloader 预检报错为准。
+
+统一通知钩子（2026-11-19 已实现）：`notify_scripts`（默认空）——`notify.Notifier` 以 `EMBYTOOL_*` env-var 协议触发用户脚本（completed/failed/cancelled）；单并发线程池派发、10s 超时、脚本失败不影响任务成败（SABnzbd 语义）。`notify.py` 独立于 AppService，GUI/CLI 可复用尚未接入（目前仅 Web 队列路径发事件）。回归 `tests/test_notify_hooks.py`（真实子进程）。Webhook（Discord/Telegram 模板）未做，可基于同一协议扩展。
 
 ### P2：真实 GUI/Web 交互验收
 
