@@ -37,6 +37,7 @@ class AppConfig:
     job_history_limit: int = 200
     flush_interval_seconds: float = 0.0
     download_subtitles: bool = True
+    notify_scripts: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)

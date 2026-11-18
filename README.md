@@ -252,6 +252,7 @@ Web 模式默认**仅监听 `127.0.0.1`**，并自 v0.2 起启用访问令牌鉴
   "job_history_limit": 200,
   "flush_interval_seconds": 0.0,
   "download_subtitles": true,
+  "notify_scripts": [],
   "web_allowed_hosts": []
 }
 ```
@@ -281,6 +282,7 @@ Web 模式默认**仅监听 `127.0.0.1`**，并自 v0.2 起启用访问令牌鉴
 | `job_history_limit` | Web 队列保留的终态任务条数上限，默认 200；超出时清理最早的已完成/失败/取消任务及其批次计数与条目锁，活动任务与磁盘下载记录不受影响；`0` 为不清理 |
 | `flush_interval_seconds` | 预分配分段下载的刷盘节流间隔（秒），默认 `0` 为每个数据块落盘一次（现行为）；大于 0 时按秒批量刷盘与更新断点元数据，暂停/取消/分段结束仍精确落盘，硬崩溃后至多重传该间隔内的带宽量 |
 | `download_subtitles` | 下载完成后是否顺带保存 Emby 外挂文本字幕（同名 `.语言.srt` 存于视频旁），默认 `true`；字幕失败不影响主文件成败 |
+| `notify_scripts` | 下载事件通知脚本路径列表，默认 `[]` 不启用；条目完成/失败/取消时以环境变量 `EMBYTOOL_EVENTTYPE`（completed/failed/cancelled）、`EMBYTOOL_ITEM_ID`、`EMBYTOOL_ITEM_NAME`、`EMBYTOOL_PATH`、`EMBYTOOL_ERROR`、`EMBYTOOL_BATCH_ID`、`EMBYTOOL_SKIPPED` 触发；脚本失败/超时不影响下载任务 |
 | `web_allowed_hosts` | Web Host 白名单额外允许的主机名/IP 列表（远程访问时填写），默认 `[]` |
 
 ---

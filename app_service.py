@@ -19,6 +19,7 @@ from emby_client import EmbyClient, EmbyClientError
 from library import CacheLibrary, redact_url
 from logger import get_logger, setup_logging
 from models import DownloadRecord, MediaItem
+from notify import Notifier
 
 logger = get_logger()
 
@@ -103,6 +104,7 @@ class AppService:
         self._jobs: dict[str, _DownloadJob] = {}
         self._batches: dict[str, dict[str, int]] = {}
         self._item_locks: dict[str, threading.Lock] = {}
+        self.notifier = Notifier([])  # load() 时按 config.notify_scripts 重建
         self._state_lock = threading.Lock()
         self._status_condition = threading.Condition()
         self._status_version = 0
@@ -139,6 +141,9 @@ class AppService:
         self.config = config
         self.client = EmbyClient(config)
         self.library = CacheLibrary(config.database_path)
+        self.notifier = Notifier(list(config.notify_scripts))
+        if config.notify_scripts:
+            self._record_log(f"已启用通知脚本：{', '.join(config.notify_scripts)}")
         interrupted = self.library.reconcile_interrupted()
         if interrupted:
             self._record_log(f"启动对账：{interrupted} 条残留 downloading 记录已标记为 interrupted")
@@ -519,11 +524,25 @@ class AppService:
                 self._record_log(f"文件已存在，跳过：{job.item.name}")
             else:
                 self._record_log(f"已保存：{path}")
+            self.notifier.emit(
+                "completed",
+                item_id=job.item.item_id,
+                item_name=job.item.name,
+                path=str(path) if path else "",
+                batch_id=job.batch_id,
+                skipped=result == "skipped",
+            )
         except DownloadCancelled:
             with self._state_lock:
                 job.status = "cancelled"
                 job.result = "cancelled"
             self._record_log(f"已取消：{job.item.name}")
+            self.notifier.emit(
+                "cancelled",
+                item_id=job.item.item_id,
+                item_name=job.item.name,
+                batch_id=job.batch_id,
+            )
         except (DownloadError, EmbyClientError, OSError) as exc:
             disk_gated = "磁盘空间不足" in str(exc)
             with self._state_lock:
@@ -542,6 +561,13 @@ class AppService:
                             other.error = "因磁盘空间不足自动取消，清理空间后可重新下载"
                             cancelled_for_disk.append(other)
             self._record_log(f"下载失败：{job.item.name}（{exc}）")
+            self.notifier.emit(
+                "failed",
+                item_id=job.item.item_id,
+                item_name=job.item.name,
+                error=str(exc),
+                batch_id=job.batch_id,
+            )
             if disk_gated:
                 self._record_log(
                     f"磁盘空间不足：已自动取消 {len(cancelled_for_disk)} 个排队任务；"

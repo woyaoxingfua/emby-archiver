@@ -65,6 +65,9 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
         job_history_limit=max(0, int(raw.get("job_history_limit", 200))),
         flush_interval_seconds=max(0.0, float(raw.get("flush_interval_seconds", 0.0))),
         download_subtitles=_as_bool(raw.get("download_subtitles", True)),
+        notify_scripts=tuple(
+            str(s).strip() for s in raw.get("notify_scripts", []) if str(s).strip()
+        ),
     )
 
     cfg.download_dir.mkdir(parents=True, exist_ok=True)
