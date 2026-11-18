@@ -418,6 +418,34 @@ class EmbyCacheGui:
             return None
         return self.library.get(str(selected[0]))
 
+    def _cleanup_empty_dirs(self, path: Path) -> int:
+        """删除文件后清理其所在链上的空目录，止步于下载根目录。
+
+        与 AppService.delete_record 语义一致：只删空目录且绝不越过下载根
+        （用户配置的 download_dir），有内容的目录不受影响。
+        """
+        if not self.config:
+            return 0
+        roots = {self.config.download_dir.resolve()}
+        removed = 0
+        current = path.parent
+        while current != current.parent:
+            try:
+                if current.resolve() in roots or not current.exists():
+                    break
+                entries = list(current.iterdir())
+            except OSError:
+                break
+            if entries:
+                break
+            try:
+                current.rmdir()
+            except OSError:
+                break
+            removed += 1
+            current = current.parent
+        return removed
+
     def _on_download_record_select(self, _event=None) -> None:
         self._update_download_record_buttons()
 
@@ -539,6 +567,7 @@ class EmbyCacheGui:
             meta_path.with_name(meta_path.name + ".tmp").unlink(missing_ok=True)
             for seg_path in _seg_files(temp_path):
                 seg_path.unlink(missing_ok=True)
+            self._cleanup_empty_dirs(path)
             assert self.library is not None
             self.library.delete(record.item_id)
             self.refresh_downloads()

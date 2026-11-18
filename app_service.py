@@ -695,11 +695,44 @@ class AppService:
                 if seg_path.is_file() and seg_path.name.startswith(seg_prefix):
                     seg_path.unlink(missing_ok=True)
         self.library.delete(item_id)
+        removed_empty_dirs = self._cleanup_empty_dirs(path, removed_file)
         if removed_file:
             self._record_log(f"已删除文件和记录：{path}")
         else:
             self._record_log(f"文件已不存在，仅移除记录：{path}")
-        return {"removed_file": removed_file, "path": str(path)}
+        return {
+            "removed_file": removed_file,
+            "path": str(path),
+            "removed_empty_dirs": removed_empty_dirs,
+        }
+
+    def _cleanup_empty_dirs(self, path: Path, removed_file: bool) -> int:
+        """删除文件后清理其所在链上的空目录，止步于下载根目录。
+
+        影片按 `影片名 (年份)/影片名 (年份).mp4`、剧集按 `剧名/季名/集.mkv` 建目录；
+        只删空目录且绝不越过下载根（config.download_dir 或 job 覆盖目录），
+        用户自建的有内容目录不受影响。返回删除的目录数。
+        """
+        assert self.config is not None
+        roots = {self.config.download_dir.resolve()}
+        removed = 0
+        current = path.parent
+        while current != current.parent:
+            try:
+                if current.resolve() in roots or not current.exists():
+                    break
+                entries = list(current.iterdir())
+            except OSError:
+                break
+            if entries:
+                break
+            try:
+                current.rmdir()
+            except OSError:
+                break
+            removed += 1
+            current = current.parent
+        return removed
 
     def open_record(self, item_id: str) -> str:
         self.ensure_ready()
