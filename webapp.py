@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import hmac
+import json
 import logging
 import secrets
 from pathlib import Path
@@ -12,7 +14,7 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from app_service import AppService
@@ -78,9 +80,12 @@ HTML_PAGE = """<!doctype html>
         <button class="warn" onclick="cancelCurrent()">取消</button>
       </div>
       <div class="row">
-        <label>并发数</label>
+        <label>单文件分段数</label>
         <input type="number" class="segments-input" id="segmentsInput" min="1" max="32" value="8">
-        <button onclick="setSegments()">设置并发</button>
+        <button onclick="setSegments()">设置分段</button>
+        <label>下载 worker</label>
+        <input type="number" class="segments-input" id="workersInput" min="1" max="8" value="1">
+        <button onclick="setWorkers()">设置 worker</button>
       </div>
       <div class="row">
         <input id="defaultDir" style="flex:1" placeholder="默认下载目录">
@@ -95,7 +100,7 @@ HTML_PAGE = """<!doctype html>
         <input id="overrideDir" style="flex:1" placeholder="本次下载目录（可留空）">
       </div>
       <div class="row">
-        <label><input type="checkbox" id="forceRestart"> 忽略 .part 重新开始</label>
+        <label><input type="checkbox" id="forceRestart"> 忽略 .part / 分段元数据重新开始</label>
       </div>
       <div id="status" class="small"></div>
       <h3>搜索结果</h3>
@@ -103,7 +108,11 @@ HTML_PAGE = """<!doctype html>
     </div>
     <div class="card">
       <h2>当前下载</h2>
+      <div id="eventState" class="small">正在连接实时推送…</div>
       <div id="currentState" class="small"></div>
+      <h3>任务队列</h3>
+      <div id="queueSummary" class="small"></div>
+      <table id="jobsTable"><thead><tr><th>状态</th><th>标题</th><th>结果 / 错误</th></tr></thead><tbody></tbody></table>
       <h3>下载记录</h3>
       <table id="downloadsTable"><thead><tr><th>状态</th><th>标题</th><th>进度</th><th>模式</th><th>路径</th><th>操作</th></tr></thead><tbody></tbody></table>
     </div>
@@ -335,55 +344,91 @@ function renderCurrentState(state) {
   `;
 }
 
+function renderConfigSummary(summary) {
+  let summaryText = `服务器: ${summary.server_url} | 默认目录: ${summary.download_dir} | workers=${summary.download_workers || 1} | segments=${summary.segments} | stream_segments=${summary.stream_segments}`;
+  if (summary.proxy_http || summary.proxy_https) {
+    summaryText += ` | 代理: HTTP=${summary.proxy_http || '无'} HTTPS=${summary.proxy_https || '无'}`;
+  }
+  if (summary.experimental_force_multipart) summaryText += ' | 强制多段: 开';
+  document.getElementById('summary').textContent = summaryText;
+  if (document.activeElement !== document.getElementById('defaultDir')) {
+    document.getElementById('defaultDir').value = summary.download_dir || '';
+  }
+  if (document.activeElement !== document.getElementById('segmentsInput')) {
+    document.getElementById('segmentsInput').value = summary.segments || 8;
+  }
+  if (document.activeElement !== document.getElementById('workersInput')) {
+    document.getElementById('workersInput').value = summary.download_workers || 1;
+  }
+}
+
+function renderJobs(jobs, state) {
+  const running = jobs.filter(j => j.status === 'running').length;
+  const queued = jobs.filter(j => j.status === 'queued').length;
+  document.getElementById('queueSummary').textContent = `运行 ${running} | 排队 ${queued} | worker ${state.worker_alive ? '活动中' : '空闲'}`;
+  const labels = {queued:'排队中', running:'下载中', completed:'已完成', failed:'失败', cancelled:'已取消'};
+  document.querySelector('#jobsTable tbody').innerHTML = jobs.slice(-30).reverse().map(job => {
+    const detail = job.error || job.result || '-';
+    return `<tr><td>${escapeHtml(labels[job.status] || job.status)}</td><td>${escapeHtml(job.item_name)}</td><td>${escapeHtml(detail)}</td></tr>`;
+  }).join('') || '<tr><td colspan="3">暂无任务</td></tr>';
+}
+
+function renderDownloadRecords(records) {
+  const tbody = document.querySelector('#downloadsTable tbody');
+  tbody.innerHTML = records.map(r => {
+    const progress = r.expected_size ? `${r.bytes_downloaded}/${r.expected_size}` : `${r.bytes_downloaded}`;
+    let actions = '';
+    if (!['completed', 'cancelled'].includes(r.status)) {
+      actions += `<button data-action="resume" data-id="${escapeHtml(r.item_id)}">继续</button> `;
+    }
+    actions += `<button class="warn" data-action="delete" data-id="${escapeHtml(r.item_id)}" data-status="${escapeHtml(r.status)}">删除</button>`;
+    return `<tr><td>${escapeHtml(r.status)}</td><td>${escapeHtml(r.item_name)}</td><td>${escapeHtml(progress)}</td><td>${escapeHtml(r.download_mode || '-')}</td><td class="path">${escapeHtml(r.target_path || '-')}</td><td>${actions}</td></tr>`;
+  }).join('');
+}
+
+function renderRealtimeLogs(lines) {
+  if (logState.currentFile !== '__realtime__') return;
+  logState.allLines = lines || [];
+  logState.total = logState.allLines.length;
+  logState.filtered = logState.allLines.length;
+  renderLogLines(logState.allLines);
+  if (document.getElementById('autoScroll').checked) {
+    const container = document.getElementById('logs');
+    container.scrollTop = container.scrollHeight;
+  }
+}
+
+function applySnapshot(snapshot) {
+  renderConfigSummary(snapshot.config);
+  renderCurrentState(snapshot.status);
+  renderJobs(snapshot.status.jobs || [], snapshot.status);
+  renderDownloadRecords(snapshot.records || []);
+  renderRealtimeLogs(snapshot.logs || []);
+}
+
 async function refreshAll() {
   try {
-    const summary = await api('/api/summary');
-    let summaryText = `服务器: ${summary.server_url} | 默认目录: ${summary.download_dir} | segments=${summary.segments} | stream_segments=${summary.stream_segments}`;
-    if (summary.proxy_http || summary.proxy_https) {
-      summaryText += ` | 代理: HTTP=${summary.proxy_http || '无'} HTTPS=${summary.proxy_https || '无'}`;
-    }
-    if (summary.experimental_force_multipart) {
-      summaryText += ' | 强制多段: 开';
-    }
-    document.getElementById('summary').textContent = summaryText;
-    document.getElementById('defaultDir').value = summary.download_dir || '';
-    document.getElementById('segmentsInput').value = summary.segments || 8;
+    renderConfigSummary(await api('/api/summary'));
   } catch (e) {
     document.getElementById('summary').textContent = String(e.message || e);
   }
   try {
     const state = await api('/api/status');
     renderCurrentState(state);
+    renderJobs(state.jobs || [], state);
   } catch (e) {
     document.getElementById('currentState').textContent = String(e.message || e);
   }
   try {
     const data = await api('/api/downloads');
-    const tbody = document.querySelector('#downloadsTable tbody');
-    tbody.innerHTML = data.records.map(r => {
-      const progress = r.expected_size ? `${r.bytes_downloaded}/${r.expected_size}` : `${r.bytes_downloaded}`;
-      let actions = '';
-      if (!['completed', 'cancelled'].includes(r.status)) {
-        actions += `<button data-action="resume" data-id="${escapeHtml(r.item_id)}">继续</button> `;
-      }
-      actions += `<button class="warn" data-action="delete" data-id="${escapeHtml(r.item_id)}" data-status="${escapeHtml(r.status)}">删除</button>`;
-      return `<tr><td>${escapeHtml(r.status)}</td><td>${escapeHtml(r.item_name)}</td><td>${escapeHtml(progress)}</td><td>${escapeHtml(r.download_mode || '-')}</td><td class="path">${escapeHtml(r.target_path || '-')}</td><td>${actions}</td></tr>`;
-    }).join('');
+    renderDownloadRecords(data.records || []);
   } catch (e) {
     document.querySelector('#downloadsTable tbody').innerHTML = `<tr><td colspan="6">${escapeHtml(e.message || e)}</td></tr>`;
   }
-  // 刷新日志（仅实时模式自动刷新，文件模式按需）
   if (logState.currentFile === '__realtime__') {
     try {
       const data = await api('/api/logs?limit=500');
-      logState.allLines = data.logs || [];
-      logState.total = logState.allLines.length;
-      logState.filtered = logState.allLines.length;
-      renderLogLines(logState.allLines);
-      if (document.getElementById('autoScroll').checked) {
-        const container = document.getElementById('logs');
-        container.scrollTop = container.scrollHeight;
-      }
+      renderRealtimeLogs(data.logs || []);
     } catch (e) {
       document.getElementById('logs').textContent = String(e.message || e);
     }
@@ -512,6 +557,20 @@ async function setSegments() {
   refreshAll();
 }
 
+async function setWorkers() {
+  const input = document.getElementById('workersInput');
+  let n = parseInt(input.value, 10);
+  if (isNaN(n) || n < 1) n = 1;
+  if (n > 8) n = 8;
+  try {
+    const data = await api('/api/control/workers', {method:'POST', body: JSON.stringify({workers: n})});
+    document.getElementById('status').textContent = `下载 worker 已设置为 ${data.workers}`;
+  } catch (e) {
+    document.getElementById('status').textContent = e.message || e;
+  }
+  refreshAll();
+}
+
 // N6：事件委托替代内联 onclick，item_id 经 escapeHtml 进入 data-* 属性，杜绝属性内 JS 注入
 document.querySelector('#downloadsTable tbody').addEventListener('click', e => {
   const btn = e.target.closest('button[data-action]');
@@ -524,8 +583,50 @@ document.querySelector('#resultsTable tbody').addEventListener('click', e => {
   if (btn) startDownload(btn.dataset.id);
 });
 
-setInterval(refreshAll, 3000);
+let eventSource = null;
+let fallbackTimer = null;
+
+function startFallbackPolling() {
+  if (fallbackTimer === null) {
+    document.getElementById('eventState').textContent = '实时推送断线，启用 5 秒兜底刷新并自动重连…';
+    fallbackTimer = setInterval(refreshAll, 5000);
+  }
+}
+
+function stopFallbackPolling() {
+  if (fallbackTimer !== null) {
+    clearInterval(fallbackTimer);
+    fallbackTimer = null;
+  }
+}
+
+function connectEvents() {
+  if (!('EventSource' in window)) {
+    startFallbackPolling();
+    return;
+  }
+  eventSource = new EventSource("/api/events");
+  eventSource.onopen = () => {
+    stopFallbackPolling();
+    document.getElementById('eventState').textContent = '实时推送已连接';
+  };
+  eventSource.addEventListener('status', event => {
+    try {
+      applySnapshot(JSON.parse(event.data));
+    } catch (e) {
+      document.getElementById('eventState').textContent = `推送数据处理失败：${e.message || e}`;
+    }
+  });
+  eventSource.onerror = () => startFallbackPolling();
+}
+
+window.addEventListener('beforeunload', () => {
+  if (eventSource) eventSource.close();
+  stopFallbackPolling();
+});
+
 refreshAll();
+connectEvents();
 populateLogFiles();
 </script>
 </body>
@@ -602,6 +703,30 @@ async def _summary(request: Request) -> Response:
 async def _status(request: Request) -> Response:
     service = request.app.state.service
     return JSONResponse(service.current_status())
+
+
+async def _events(request: Request) -> Response:
+    service = request.app.state.service
+
+    async def stream():
+        last_version = -1
+        while not await request.is_disconnected():
+            version, snapshot = await asyncio.to_thread(service.wait_for_status, last_version, 15.0)
+            if version == last_version:
+                yield ": keep-alive\n\n"
+                continue
+            last_version = version
+            payload = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+            yield f"event: status\ndata: {payload}\n\n"
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 async def _logs(request: Request) -> Response:
@@ -727,6 +852,19 @@ async def _set_segments(request: Request) -> Response:
     return _api_call(lambda: {"segments": service.set_segments(n)})
 
 
+async def _set_workers(request: Request) -> Response:
+    service = request.app.state.service
+    payload = await _json_body(request)
+    raw = payload.get("workers")
+    if raw is None or isinstance(raw, bool):
+        return _error_response("workers must be an integer")
+    try:
+        n = int(raw)
+    except (ValueError, TypeError):
+        return _error_response("workers must be an integer")
+    return _api_call(lambda: {"workers": service.set_download_workers(n)})
+
+
 async def _default_download_dir(request: Request) -> Response:
     service = request.app.state.service
     payload = await _json_body(request)
@@ -792,6 +930,7 @@ def create_web_app(service: AppService, allowed_hosts=None, token: str | None = 
             Route("/", _index, methods=["GET"]),
             Route("/api/summary", _summary, methods=["GET"]),
             Route("/api/status", _status, methods=["GET"]),
+            Route("/api/events", _events, methods=["GET"]),
             Route("/api/logs", _logs, methods=["GET"]),
             Route("/api/log-files", _log_files, methods=["GET"]),
             Route("/api/log-file", _log_file, methods=["GET"]),
@@ -805,6 +944,7 @@ def create_web_app(service: AppService, allowed_hosts=None, token: str | None = 
             Route("/api/control/resume", _resume, methods=["POST"]),
             Route("/api/control/cancel", _cancel, methods=["POST"]),
             Route("/api/control/segments", _set_segments, methods=["POST"]),
+            Route("/api/control/workers", _set_workers, methods=["POST"]),
             Route("/api/default-download-dir", _default_download_dir, methods=["POST"]),
         ],
         middleware=[Middleware(_SecurityMiddleware)],

@@ -48,6 +48,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
         timeout=int(raw.get("timeout", 30)),
         chunk_size=int(raw.get("chunk_size", 1024 * 1024)),
         segments=int(raw.get("segments", 4)),
+        download_workers=max(1, min(8, int(raw.get("download_workers", 1)))),
         experimental_force_multipart=_as_bool(raw.get("experimental_force_multipart", False)),
         proxy_http=proxy_http,
         proxy_https=proxy_https,

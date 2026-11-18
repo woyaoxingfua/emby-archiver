@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import logging
+import os
 import re
 import shutil
 import threading
@@ -35,6 +37,12 @@ class DownloadCancelled(DownloadError):
     pass
 
 
+class TargetExistsError(DownloadError):
+    """目标文件不属于当前已完成条目，禁止换候选后继续覆盖。"""
+
+    pass
+
+
 class MultipartUnavailable(DownloadError):
     def __init__(self, message: str, fallback_mode: str = "单线程回退（服务端不支持分段）") -> None:
         super().__init__(message)
@@ -60,6 +68,7 @@ class ProbeResult:
     accept_ranges: str
     content_range: str
     final_url: str
+    etag: str | None = None
 
 
 class Downloader:
@@ -134,6 +143,9 @@ class Downloader:
         target_path = self._build_target_path(item)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = target_path.with_name(target_path.name + ".part")
+        existing = self.library.get(item.item_id)
+        if target_path.exists() and not (existing and existing.status == "completed"):
+            raise TargetExistsError(f"目标文件已存在，但当前条目没有对应的已完成记录，拒绝覆盖：{target_path}")
         self._current_item = item
         self._current_temp_path = temp_path
         self._current_url = None
@@ -141,10 +153,9 @@ class Downloader:
         if force_restart:
             self._cleanup_segment_files(temp_path)
             temp_path.unlink(missing_ok=True)
-        resume_from = temp_path.stat().st_size if temp_path.exists() else 0
+        resume_from = self._paused_downloaded_bytes(temp_path)
 
         try:
-            existing = self.library.get(item.item_id)
             if target_path.exists() and existing and existing.status == "completed":
                 temp_path.unlink(missing_ok=True)
                 self._cleanup_segment_files(temp_path)
@@ -184,7 +195,7 @@ class Downloader:
                 self._emit("failed", item, resume_from, None, target_path)
                 raise DownloadError(f"无法获取下载候选地址 for {item.name}: {exc}")
             last_error: Exception | None = None
-            resume_single_notice = temp_path.exists() and not self._segment_files(temp_path)
+            resume_single_notice = temp_path.exists() and not self._segment_files(temp_path) and not self._multipart_meta_path(temp_path).exists()
             if self.segments > 1 and resume_single_notice:
                 self._emit(
                     "fallback",
@@ -239,6 +250,8 @@ class Downloader:
                     logger.warning("Download %s for %s", final_status, item.name)
                     self.library.upsert(item, target_path, final_status, bytes_downloaded, None, url, download_mode=final_mode)
                     raise
+                except TargetExistsError:
+                    raise
                 except (DownloadError, EmbyClientError, OSError) as exc:
                     last_error = exc
                     if self._is_download_feature_denied(candidate_name, exc):
@@ -280,13 +293,14 @@ class Downloader:
         resume_notice_emitted: bool = False,
     ) -> Path:
         self._current_url = url
-        resume_from = temp_path.stat().st_size if temp_path.exists() else 0
+        resume_from = self._paused_downloaded_bytes(temp_path)
         has_seg = bool(self._segment_files(temp_path))
+        has_multipart_state = has_seg or self._multipart_meta_path(temp_path).exists()
         current_mode = "准备中"
         effective_segments = self._effective_segments_for_candidate(candidate_name)
 
         if effective_segments > 1:
-            if temp_path.exists() and not has_seg:
+            if temp_path.exists() and not has_multipart_state:
                 current_mode = "单线程续传（保留已有 .part）"
                 self.library.upsert(item, target_path, "downloading", resume_from, None, url, download_mode=current_mode)
                 if not resume_notice_emitted:
@@ -317,19 +331,19 @@ class Downloader:
                     self.library.upsert(item, target_path, "downloading", resume_from, None, url, download_mode=current_mode)
                     self._emit("fallback", item, resume_from, None, target_path, str(exc))
                 except (DownloadError, EmbyClientError, OSError) as exc:
-                    # N2：分段已有进度时绝不清零回退——保留 .seg 断点，交给后续候选/下次续传
-                    if self._segment_files(temp_path):
-                        logger.warning("Multipart failed but segment progress exists; preserving .seg for resume: %s", exc)
+                    # N2：分段已有进度时绝不清零回退——保留断点，交给后续候选/下次续传
+                    if self._segment_files(temp_path) or self._multipart_meta_path(temp_path).exists():
+                        logger.warning("Multipart failed but segment progress exists; preserving resume state: %s", exc)
                         raise
                     current_mode = "单线程回退（分段失败）"
                     self.library.upsert(item, target_path, "downloading", resume_from, None, url, download_mode=current_mode)
                     self._emit("fallback", item, resume_from, None, target_path, f"分段下载失败，回退单线程：{exc}")
 
         # N2：任何回退单线程的路径都不得清掉已有分段断点（含 MultipartUnavailable 分支）
-        if self._segment_files(temp_path):
-            raise DownloadError("存在分段断点，保留 .seg 进度，本候选不回退单线程")
+        if self._segment_files(temp_path) or self._multipart_meta_path(temp_path).exists():
+            raise DownloadError("存在分段断点，保留分段进度，本候选不回退单线程")
         self._cleanup_segment_files(temp_path)
-        resume_from = temp_path.stat().st_size if temp_path.exists() else 0
+        resume_from = self._paused_downloaded_bytes(temp_path)
         if effective_segments <= 1:
             mode_detail = "单线程下载（并发数为 1）"
         elif current_mode.startswith("单线程"):
@@ -457,6 +471,8 @@ class Downloader:
             )
 
         self._cleanup_segment_files(temp_path)
+        if target_path.exists():
+            raise TargetExistsError(f"目标文件在下载过程中已出现，拒绝覆盖：{target_path}")
         temp_path.replace(target_path)
         self.library.upsert(item, target_path, "completed", final_size, expected_size, url, download_mode=mode_detail, etag=resp_etag)
         self._emit("completed", item, final_size, expected_size, target_path, mode_detail)
@@ -484,6 +500,7 @@ class Downloader:
                 probe.total,
                 f"分段并发下载（{min(segment_limit, probe.total)} 段)",
                 segment_limit,
+                source_etag=probe.etag,
             )
 
         if not self.client.config.experimental_force_multipart:
@@ -491,14 +508,19 @@ class Downloader:
                 f"标准 Range 探测未通过：HTTP {probe.status_code}；Accept-Ranges={probe.accept_ranges or '-'}；Content-Range={probe.content_range or '-'}"
             )
 
-        forced_total = probe.total or self._probe_total_size(item, target_path, url, candidate_name)
+        forced_total = probe.total
+        forced_etag = probe.etag
+        if forced_total is None:
+            forced_total, forced_etag = self._probe_total_size(item, target_path, url, candidate_name)
         if forced_total is None or forced_total <= 1:
             raise MultipartUnavailable(
                 "标准探测失败，且实验模式无法确认可分段的总大小，回退单线程",
                 fallback_mode="单线程回退（实验性分段失败）",
             )
 
-        validated_total = self._probe_forced_multipart(item, target_path, url, candidate_name, forced_total)
+        validated_total, validated_etag = self._probe_forced_multipart(
+            item, target_path, url, candidate_name, forced_total, forced_etag
+        )
         return self._download_segments(
             item,
             target_path,
@@ -507,6 +529,7 @@ class Downloader:
             validated_total,
             f"实验性强制分段下载（{min(segment_limit, validated_total)} 段)",
             segment_limit,
+            source_etag=validated_etag,
         )
 
     def _probe_range_support(self, item: MediaItem, target_path: Path, url: str, candidate_name: str) -> ProbeResult:
@@ -524,6 +547,7 @@ class Downloader:
                 accept_ranges=response.headers.get("Accept-Ranges", ""),
                 content_range=response.headers.get("Content-Range", ""),
                 final_url=response.url,
+                etag=response.headers.get("ETag"),
             )
         finally:
             response.close()
@@ -537,7 +561,7 @@ class Downloader:
         self._emit("diagnostic", item, 0, result.total, target_path, detail)
         return result
 
-    def _probe_total_size(self, item: MediaItem, target_path: Path, url: str, candidate_name: str) -> int | None:
+    def _probe_total_size(self, item: MediaItem, target_path: Path, url: str, candidate_name: str) -> tuple[int | None, str | None]:
         response = self.client.session.get(
             url,
             stream=True,
@@ -554,8 +578,8 @@ class Downloader:
             logger.info(detail)
             self._emit("diagnostic", item, 0, total, target_path, detail)
             if response.status_code not in {200, 206}:
-                return None
-            return total
+                return None, response.headers.get("ETag")
+            return total, response.headers.get("ETag")
         finally:
             response.close()
 
@@ -566,7 +590,10 @@ class Downloader:
         url: str,
         candidate_name: str,
         total: int,
-    ) -> int:
+        expected_etag: str | None,
+    ) -> tuple[int, str | None]:
+        observed_etag = expected_etag
+        etag_established = expected_etag is not None
         probe_ranges = self._multipart_plan_from_total(total, min(2, total))
         if len(probe_ranges) < 2:
             raise MultipartUnavailable(
@@ -595,6 +622,15 @@ class Downloader:
                         f"实验分段探测失败：bytes={start}-{end} 返回 HTTP {response.status_code}",
                         fallback_mode="单线程回退（实验性分段失败）",
                     )
+                response_etag = response.headers.get("ETag")
+                if not etag_established:
+                    observed_etag = response_etag
+                    etag_established = True
+                elif response_etag != observed_etag:
+                    raise MultipartUnavailable(
+                        "实验分段探测失败：不同区间的 ETag 不一致",
+                        fallback_mode="单线程回退（实验性分段失败）",
+                    )
                 parsed = _parse_content_range(content_range)
                 if parsed is None:
                     raise MultipartUnavailable(
@@ -609,7 +645,110 @@ class Downloader:
                     )
             finally:
                 response.close()
-        return total
+        return total, observed_etag
+
+    def _segments_match_source(
+        self,
+        item: MediaItem,
+        temp_path: Path,
+        url: str,
+        total: int,
+        num_segments: int,
+        source_etag: str,
+    ) -> bool:
+        """旧断点没有 ETag 时，以当前源字节校验后再决定是否复用。"""
+        for idx, start, end in self._multipart_plan_from_total(total, num_segments):
+            seg_path = temp_path.with_suffix(f".part.seg{idx}")
+            seg_size = seg_path.stat().st_size if seg_path.exists() else 0
+            if not seg_size:
+                continue
+            if seg_size > end - start + 1:
+                return False
+            range_end = start + seg_size - 1
+            response = self.client.session.get(
+                url,
+                headers={"Range": f"bytes={start}-{range_end}", "If-Range": source_etag},
+                stream=True,
+                timeout=self.client.config.timeout,
+                allow_redirects=True,
+            )
+            try:
+                if response.status_code != 206:
+                    raise EmbyClientError(f"旧分段校验 HTTP {response.status_code}")
+                if response.headers.get("ETag") != source_etag:
+                    raise EmbyClientError("旧分段校验时源 ETag 已变化")
+                parsed = _parse_content_range(response.headers.get("Content-Range", ""))
+                if parsed != (start, range_end, total):
+                    raise EmbyClientError("旧分段校验 Content-Range mismatch")
+                compared = 0
+                with seg_path.open("rb") as handle:
+                    for chunk in response.iter_content(chunk_size=self.client.config.chunk_size):
+                        if not chunk:
+                            continue
+                        if handle.read(len(chunk)) != chunk:
+                            return False
+                        compared += len(chunk)
+                        if compared > seg_size:
+                            return False
+                if compared != seg_size:
+                    raise EmbyClientError(f"旧分段校验响应不完整：{compared}/{seg_size}")
+            finally:
+                response.close()
+        return True
+
+    @staticmethod
+    def _multipart_meta_path(temp_path: Path) -> Path:
+        return temp_path.with_name(temp_path.name + ".meta.json")
+
+    @staticmethod
+    def _empty_multipart_metadata(total: int, source_etag: str | None, plan: list[tuple[int, int, int]]) -> dict:
+        return {
+            "version": 1,
+            "total": total,
+            "etag": source_etag,
+            "segments": [
+                {"index": idx, "start": start, "end": end, "received": 0}
+                for idx, start, end in plan
+            ],
+        }
+
+    @staticmethod
+    def _write_multipart_metadata(meta_path: Path, state: dict) -> None:
+        # 先刷数据，再原子替换元数据；崩溃后至多重复下载已写入但未登记的区间。
+        tmp_path = meta_path.with_name(meta_path.name + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            json.dump(state, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, meta_path)
+
+    @staticmethod
+    def _load_multipart_metadata(
+        meta_path: Path,
+        total: int,
+        source_etag: str | None,
+        plan: list[tuple[int, int, int]],
+    ) -> dict | None:
+        try:
+            state = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return None
+        if not isinstance(state, dict) or state.get("version") != 1:
+            return None
+        if state.get("total") != total or state.get("etag") != source_etag:
+            return None
+        segments = state.get("segments")
+        if not isinstance(segments, list) or len(segments) != len(plan):
+            return None
+        for segment, (idx, start, end) in zip(segments, plan):
+            if not isinstance(segment, dict):
+                return None
+            received = segment.get("received")
+            if (segment.get("index"), segment.get("start"), segment.get("end")) != (idx, start, end):
+                return None
+            if not isinstance(received, int) or isinstance(received, bool) or not 0 <= received <= end - start + 1:
+                return None
+        return state
 
     def _download_segments(
         self,
@@ -620,6 +759,214 @@ class Downloader:
         total: int,
         mode_prefix: str,
         segment_limit: int,
+        source_etag: str | None,
+    ) -> Path:
+        # 旧 .seg 仅作为兼容输入走原路径；新格式始终直接写预分配 .part。
+        if self._segment_files(temp_path):
+            return self._download_segments_with_merge(
+                item, target_path, temp_path, url, total, mode_prefix, segment_limit, source_etag
+            )
+        return self._download_segments_preallocated(
+            item, target_path, temp_path, url, total, mode_prefix, segment_limit, source_etag
+        )
+
+    def _download_segments_preallocated(
+        self,
+        item: MediaItem,
+        target_path: Path,
+        temp_path: Path,
+        url: str,
+        total: int,
+        mode_prefix: str,
+        segment_limit: int,
+        source_etag: str | None,
+    ) -> Path:
+        if total <= 1:
+            raise MultipartUnavailable("文件过小，不适合分段下载")
+        num_segments = max(1, min(segment_limit, total))
+        if num_segments <= 1:
+            raise MultipartUnavailable("文件过小，不适合分段下载")
+
+        plan = self._multipart_plan_from_total(total, num_segments)
+        meta_path = self._multipart_meta_path(temp_path)
+        state = self._load_multipart_metadata(meta_path, total, source_etag, plan)
+        if state is not None and (not temp_path.exists() or temp_path.stat().st_size != total):
+            state = None
+        if state is not None and not source_etag and any(
+            segment["received"] for segment in state["segments"]
+        ):
+            # 无验证器的旧字节不能跨候选或跨进程复用。
+            state = None
+
+        if state is None:
+            if not temp_path.exists() or temp_path.stat().st_size != total:
+                self._check_disk_space(target_path.parent, total, 0, multipart=False)
+            state = self._empty_multipart_metadata(total, source_etag, plan)
+            self._write_multipart_metadata(meta_path, state)
+            with temp_path.open("w+b") as handle:
+                handle.truncate(total)
+                handle.flush()
+                os.fsync(handle.fileno())
+
+        state_lock = threading.Lock()
+        errors: list[Exception] = []
+        shutdown = threading.Event()
+        mode_detail = mode_prefix
+        self._current_mode = mode_detail
+        self._current_expected = total
+        downloaded_bytes = sum(segment["received"] for segment in state["segments"])
+        self.library.upsert(
+            item,
+            target_path,
+            "downloading",
+            downloaded_bytes,
+            total,
+            url,
+            download_mode=mode_detail,
+            etag=source_etag,
+            clear_etag=source_etag is None,
+        )
+
+        def emit_progress() -> None:
+            with state_lock:
+                current = sum(segment["received"] for segment in state["segments"])
+            self._maybe_upsert_progress(item, target_path, current, total, url, mode_detail)
+            self._emit("progress", item, current, total, target_path)
+
+        def download_segment(segment: dict) -> None:
+            idx = segment["index"]
+            start = segment["start"]
+            end = segment["end"]
+            max_attempts = max(1, self.client.config.retry_attempts)
+            attempts = 0
+            while True:
+                if shutdown.is_set() or self.cancel_event.is_set():
+                    return
+                with state_lock:
+                    received = segment["received"]
+                actual_start = start + received
+                if actual_start > end:
+                    return
+                headers = {"Range": f"bytes={actual_start}-{end}"}
+                if source_etag:
+                    headers["If-Range"] = source_etag
+                response = None
+                try:
+                    response = self.client.session.get(
+                        url,
+                        headers=headers,
+                        stream=True,
+                        timeout=self.client.config.timeout,
+                        allow_redirects=True,
+                    )
+                    if response.status_code != 206:
+                        raise EmbyClientError(f"Segment {idx} HTTP {response.status_code}")
+                    if source_etag and response.headers.get("ETag") != source_etag:
+                        raise EmbyClientError(f"Segment {idx} ETag mismatch")
+                    parsed = _parse_content_range(response.headers.get("Content-Range", ""))
+                    if parsed != (actual_start, end, total):
+                        raise EmbyClientError(f"Segment {idx} Content-Range mismatch")
+                    with temp_path.open("r+b") as output:
+                        output.seek(actual_start)
+                        for chunk in response.iter_content(chunk_size=self.client.config.chunk_size):
+                            self._check_cancelled()
+                            if shutdown.is_set():
+                                break
+                            if self.pause_event.is_set():
+                                response.close()
+                                while self.pause_event.is_set() and not self.cancel_event.is_set() and not shutdown.is_set():
+                                    time.sleep(0.2)
+                                if self.cancel_event.is_set():
+                                    raise DownloadCancelled("用户取消下载")
+                                if shutdown.is_set():
+                                    return
+                                raise _PauseRestart()
+                            if not chunk:
+                                continue
+                            if len(chunk) > end - actual_start + 1:
+                                raise EmbyClientError(f"Segment {idx} 返回字节超过请求区间")
+                            self._limiter.acquire(len(chunk))
+                            output.write(chunk)
+                            output.flush()
+                            os.fsync(output.fileno())
+                            actual_start += len(chunk)
+                            with state_lock:
+                                segment["received"] += len(chunk)
+                                self._write_multipart_metadata(meta_path, state)
+                            emit_progress()
+                    return
+                except _PauseRestart:
+                    continue
+                except DownloadCancelled:
+                    shutdown.set()
+                    return
+                except (requests.RequestException, EmbyClientError, OSError) as exc:
+                    attempts += 1
+                    if attempts >= max_attempts or shutdown.is_set():
+                        with state_lock:
+                            errors.append(exc)
+                        shutdown.set()
+                        return
+                    backoff = min(
+                        self.client.config.retry_backoff_max,
+                        self.client.config.retry_backoff_base * (2 ** (attempts - 1)),
+                    )
+                    logger.warning("分段 %s 第 %s 次请求失败（%s），%.1f 秒后重试", idx, attempts, exc, backoff)
+                    deadline = time.monotonic() + backoff
+                    while time.monotonic() < deadline:
+                        if shutdown.is_set() or self.cancel_event.is_set():
+                            return
+                        time.sleep(0.1)
+                finally:
+                    if response is not None:
+                        response.close()
+
+        self._emit("mode", item, downloaded_bytes, total, target_path, mode_detail)
+        if downloaded_bytes:
+            emit_progress()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_segments) as executor:
+            futures = [executor.submit(download_segment, segment) for segment in state["segments"]]
+            concurrent.futures.wait(futures)
+        self._check_cancelled()
+        if errors:
+            raise DownloadError(f"分段下载失败：{errors[0]}")
+        with state_lock:
+            received_by_segment = [segment["received"] for segment in state["segments"]]
+        expected_by_segment = [end - start + 1 for _, start, end in plan]
+        if received_by_segment != expected_by_segment:
+            raise DownloadError(
+                f"分段下载不完整：{sum(received_by_segment)}/{total} 字节"
+            )
+        if temp_path.stat().st_size != total:
+            raise DownloadError("预分配文件大小与预期不一致")
+        if target_path.exists():
+            raise TargetExistsError(f"目标文件在下载过程中已出现，拒绝覆盖：{target_path}")
+        temp_path.replace(target_path)
+        self.library.upsert(
+            item,
+            target_path,
+            "completed",
+            total,
+            total,
+            url,
+            download_mode=mode_detail,
+            etag=source_etag,
+            clear_etag=source_etag is None,
+        )
+        self._cleanup_segment_files(temp_path)
+        self._emit("completed", item, total, total, target_path, mode_detail)
+        return target_path
+
+    def _download_segments_with_merge(
+        self,
+        item: MediaItem,
+        target_path: Path,
+        temp_path: Path,
+        url: str,
+        total: int,
+        mode_prefix: str,
+        segment_limit: int,
+        source_etag: str | None,
     ) -> Path:
         if total <= 1:
             raise MultipartUnavailable("文件过小，不适合分段下载")
@@ -627,6 +974,28 @@ class Downloader:
         num_segments = max(1, min(segment_limit, total))
         if num_segments <= 1:
             raise MultipartUnavailable("文件过小，不适合分段下载")
+
+        resume_segments = self._segment_files(temp_path)
+        prior = self.library.get(item.item_id)
+        prior_etag = prior.etag if prior else None
+        restart_detail = None
+        if resume_segments and not source_etag:
+            restart_detail = "当前源缺少 ETag，无法安全复用旧分段，将从头下载"
+        elif resume_segments and not prior_etag:
+            try:
+                legacy_matches = self._segments_match_source(item, temp_path, url, total, num_segments, source_etag)
+            except requests.RequestException as exc:
+                raise EmbyClientError(f"旧分段内容校验失败：{exc}") from exc
+            if not legacy_matches:
+                restart_detail = "无 ETag 记录的旧分段与当前源内容不一致，将从头下载"
+        elif resume_segments and source_etag != prior_etag:
+            restart_detail = "分段源 ETag 已变化，丢弃旧分段并从头下载，避免混拼"
+
+        if restart_detail:
+            logger.warning("%s: item_id=%s", restart_detail, item.item_id)
+            self._emit("diagnostic", item, 0, total, target_path, restart_detail)
+            self._cleanup_segment_files(temp_path)
+            temp_path.unlink(missing_ok=True)
 
         if temp_path.exists():
             temp_path.unlink(missing_ok=True)
@@ -648,9 +1017,20 @@ class Downloader:
             downloaded_bytes += seg_resume
             segment_specs.append((idx, start, end, seg_temp, seg_resume))
 
+        self._check_disk_space(target_path.parent, total, downloaded_bytes, multipart=True)
         self._current_mode = mode_detail
         self._current_expected = total
-        self.library.upsert(item, target_path, "downloading", downloaded_bytes, total, url, download_mode=mode_detail)
+        self.library.upsert(
+            item,
+            target_path,
+            "downloading",
+            downloaded_bytes,
+            total,
+            url,
+            download_mode=mode_detail,
+            etag=source_etag,
+            clear_etag=source_etag is None,
+        )
 
         def emit_progress() -> None:
             with lock:
@@ -675,6 +1055,8 @@ class Downloader:
                 if actual_start > end:
                     return
                 headers = {"Range": f"bytes={actual_start}-{end}"}
+                if source_etag:
+                    headers["If-Range"] = source_etag
                 response = None
                 try:
                     response = self.client.session.get(
@@ -686,6 +1068,8 @@ class Downloader:
                     )
                     if response.status_code != 206:
                         raise EmbyClientError(f"Segment {idx} HTTP {response.status_code}")
+                    if source_etag and response.headers.get("ETag") != source_etag:
+                        raise EmbyClientError(f"Segment {idx} ETag mismatch")
                     content_range = response.headers.get("Content-Range", "")
                     parsed = _parse_content_range(content_range)
                     if parsed is None:
@@ -772,8 +1156,20 @@ class Downloader:
                 seg_temp.unlink(missing_ok=True)
 
         self._cleanup_segment_files(temp_path)
+        if target_path.exists():
+            raise TargetExistsError(f"目标文件在下载过程中已出现，拒绝覆盖：{target_path}")
         temp_path.replace(target_path)
-        self.library.upsert(item, target_path, "completed", total, total, url, download_mode=mode_detail)
+        self.library.upsert(
+            item,
+            target_path,
+            "completed",
+            total,
+            total,
+            url,
+            download_mode=mode_detail,
+            etag=source_etag,
+            clear_etag=source_etag is None,
+        )
         self._emit("completed", item, total, total, target_path, mode_detail)
         return target_path
 
@@ -790,6 +1186,9 @@ class Downloader:
     def _cleanup_segment_files(self, temp_path: Path) -> None:
         for seg_path in self._segment_files(temp_path):
             seg_path.unlink(missing_ok=True)
+        meta_path = self._multipart_meta_path(temp_path)
+        meta_path.unlink(missing_ok=True)
+        meta_path.with_name(meta_path.name + ".tmp").unlink(missing_ok=True)
 
     def _segment_files(self, temp_path: Path) -> list[Path]:
         # N9：用 iterdir+startswith 替代 glob，避免标题中的 [ ] 等元字符导致匹配失败
@@ -818,7 +1217,7 @@ class Downloader:
         except OSError:
             return
         remaining = max(0, expected_size - resume_from)
-        required = remaining * 2 if multipart else remaining
+        required = remaining + expected_size if multipart else remaining
         if free < required:
             raise DownloadError(
                 f"磁盘空间不足：需要约 {required} 字节，剩余 {free} 字节（目录 {folder}）"
@@ -834,6 +1233,17 @@ class Downloader:
             raise DownloadCancelled("用户取消下载")
 
     def _paused_downloaded_bytes(self, temp_path: Path) -> int:
+        meta_path = self._multipart_meta_path(temp_path)
+        if meta_path.exists():
+            try:
+                state = json.loads(meta_path.read_text(encoding="utf-8"))
+                return sum(
+                    segment.get("received", 0)
+                    for segment in state.get("segments", [])
+                    if isinstance(segment.get("received", 0), int)
+                )
+            except (OSError, ValueError, TypeError, AttributeError):
+                return 0
         total = temp_path.stat().st_size if temp_path.exists() else 0
         for seg_path in self._segment_files(temp_path):
             total += seg_path.stat().st_size

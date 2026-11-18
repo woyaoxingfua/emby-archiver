@@ -12,6 +12,7 @@
   "timeout": 30,
   "chunk_size": 1048576,
   "segments": 4,
+  "download_workers": 1,
   "experimental_force_multipart": false,
   "proxy": "",
   "proxy_http": "",

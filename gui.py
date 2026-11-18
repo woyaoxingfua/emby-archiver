@@ -220,6 +220,9 @@ class EmbyCacheGui:
             setup_logging(config.log_dir, config.log_level)
             self.client = EmbyClient(config)
             self.library = CacheLibrary(config.database_path)
+            interrupted = self.library.reconcile_interrupted()
+            if interrupted:
+                self.log(f"启动对账：{interrupted} 条残留 downloading 记录已标记为 interrupted")
             self.segments_var.set(config.segments)
             self.download_dir_var.set(str(config.download_dir))
             self.downloader = Downloader(self.client, self.library, progress_callback=self._download_progress, segments=config.segments)
@@ -337,7 +340,7 @@ class EmbyCacheGui:
             return False
         target_path = self.downloader._build_target_path(item)
         temp_path = target_path.with_name(target_path.name + ".part")
-        has_partial = temp_path.exists() or bool(_seg_files(temp_path))
+        has_partial = temp_path.exists() or bool(_seg_files(temp_path)) or self.downloader._multipart_meta_path(temp_path).exists()
         if not has_partial:
             return False
         answer = messagebox.askyesnocancel(
@@ -531,6 +534,9 @@ class EmbyCacheGui:
                 file_removed = True
             temp_path = path.with_name(path.name + ".part")
             temp_path.unlink(missing_ok=True)
+            meta_path = temp_path.with_name(temp_path.name + ".meta.json")
+            meta_path.unlink(missing_ok=True)
+            meta_path.with_name(meta_path.name + ".tmp").unlink(missing_ok=True)
             for seg_path in _seg_files(temp_path):
                 seg_path.unlink(missing_ok=True)
             assert self.library is not None
@@ -602,16 +608,24 @@ class EmbyCacheGui:
                 self.event_queue.put(("log", f"本次下载目录：{override_dir}"))
             if force_restart:
                 self.event_queue.put(("log", "已启用“忽略 .part 重新开始”，本次会删除断点后重新下载"))
+            ok = failed = skipped = 0
             for sub_item in items:
                 try:
                     path = self.downloader.download_item(sub_item, force_restart=force_restart)
                     if self.downloader.last_result_status == "skipped":
+                        skipped += 1
                         self.event_queue.put(("log", f"已存在，跳过下载：{path}"))
                     else:
+                        ok += 1
                         self.event_queue.put(("log", f"已保存：{path}"))
                 except DownloadCancelled:
                     self.event_queue.put(("log", f"已取消：{sub_item.name}"))
                     break
+                except (DownloadError, EmbyClientError, OSError) as exc:
+                    failed += 1
+                    self.event_queue.put(("log", f"单集失败，继续下一集：{sub_item.name}（{exc}）"))
+                    continue
+            self.event_queue.put(("log", f"批量下载结束：成功 {ok} / 失败 {failed} / 跳过 {skipped}"))
             self.event_queue.put(("downloads_refresh", None))
         finally:
             self.client.config.download_dir = original_download_dir

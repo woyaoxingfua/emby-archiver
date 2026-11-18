@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import platform
+import threading
 from typing import Any
 from urllib.parse import urlencode, urlparse
 
@@ -36,28 +37,46 @@ class EmbyClient:
 
     def __init__(self, config: AppConfig) -> None:
         self.config = config
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": config.user_agent,
-                "Accept": "application/json",
-            }
-        )
-        proxies = {}
-        if config.proxy_http:
-            proxies["http"] = config.proxy_http
-        if config.proxy_https:
-            proxies["https"] = config.proxy_https
-        if proxies:
-            self.session.proxies.update(proxies)
-            logger.info("HTTP proxies enabled: http=%s https=%s", proxies.get("http", "-"), proxies.get("https", "-"))
         self.access_token = config.access_token
         self.api_key = config.api_key
         self.user_id = config.user_id
         self.device_id = platform.node() or config.device_name.replace(" ", "-")
         # P3：连接超时与读取超时分离，避免连接阶段长时间挂起
         self._timeout = (min(10, config.timeout), config.timeout)
+        self._session_local = threading.local()
+        self._sessions_lock = threading.Lock()
+        self._sessions: set[requests.Session] = set()
+        if config.proxy_http or config.proxy_https:
+            logger.info("HTTP proxies enabled: http=%s https=%s", config.proxy_http or "-", config.proxy_https or "-")
         self._refresh_auth_headers()
+
+    def _build_session(self) -> requests.Session:
+        session = requests.Session()
+        session.headers.update({"User-Agent": self.config.user_agent, "Accept": "application/json"})
+        if self.config.proxy_http:
+            session.proxies["http"] = self.config.proxy_http
+        if self.config.proxy_https:
+            session.proxies["https"] = self.config.proxy_https
+        self._apply_auth_headers(session)
+        return session
+
+    @property
+    def session(self) -> requests.Session:
+        session = getattr(self._session_local, "session", None)
+        if session is None:
+            session = self._build_session()
+            self._session_local.session = session
+            with self._sessions_lock:
+                self._sessions.add(session)
+        return session
+
+    def close(self) -> None:
+        with self._sessions_lock:
+            sessions = list(self._sessions)
+            self._sessions.clear()
+        for session in sessions:
+            session.close()
+        self._session_local.session = None
 
     def authenticate(self) -> dict[str, Any]:
         if self.access_token or self.api_key:
@@ -238,13 +257,20 @@ class EmbyClient:
         query = urlencode(params)
         return f"{self._url(path)}?{query}" if query else self._url(path)
 
-    def _refresh_auth_headers(self) -> None:
-        self.session.headers["X-Emby-Authorization"] = self._authorization_header(include_token=True)
+    def _apply_auth_headers(self, session: requests.Session) -> None:
+        session.headers["X-Emby-Authorization"] = self._authorization_header(include_token=True)
         token = self.api_key or self.access_token
         if token:
-            self.session.headers["X-Emby-Token"] = token
-        elif "X-Emby-Token" in self.session.headers:
-            del self.session.headers["X-Emby-Token"]
+            session.headers["X-Emby-Token"] = token
+        else:
+            session.headers.pop("X-Emby-Token", None)
+
+    def _refresh_auth_headers(self) -> None:
+        self.session  # 确保当前线程的 Session 已创建并登记
+        with self._sessions_lock:
+            sessions = list(self._sessions)
+        for session in sessions:
+            self._apply_auth_headers(session)
 
     def _authorization_header(self, include_token: bool) -> str:
         parts = [

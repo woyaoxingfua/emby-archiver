@@ -20,6 +20,7 @@ class AppConfig:
     timeout: int = 30
     chunk_size: int = 1024 * 1024
     segments: int = 4
+    download_workers: int = 1
     experimental_force_multipart: bool = False
     proxy_http: Optional[str] = None
     proxy_https: Optional[str] = None

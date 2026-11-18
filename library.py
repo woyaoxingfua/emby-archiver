@@ -113,6 +113,7 @@ class CacheLibrary:
         source_url: str | None,
         download_mode: str | None = None,
         etag: str | None = None,
+        clear_etag: bool = False,
     ) -> None:
         source_url = redact_url(source_url)
         with self._connect() as conn:
@@ -121,7 +122,10 @@ class CacheLibrary:
                 (item.item_id,),
             ).fetchone()
             resolved_mode = download_mode if download_mode is not None else (current[0] if current else None)
-            resolved_etag = etag if etag is not None else (current[1] if current else None)
+            if clear_etag:
+                resolved_etag = None
+            else:
+                resolved_etag = etag if etag is not None else (current[1] if current else None)
             conn.execute(
                 """
                 INSERT INTO downloads (

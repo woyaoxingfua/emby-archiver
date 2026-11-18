@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import os
+import queue
 import re
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections import deque
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +66,25 @@ def _open_path(path: Path) -> None:
         subprocess.Popen([opener, str(path)])
 
 
+@dataclass
+class _DownloadJob:
+    job_id: str
+    batch_id: str
+    item: MediaItem
+    force_restart: bool = False
+    override_dir: Path | None = None
+    status: str = "queued"
+    result: str | None = None
+    error: str | None = None
+    created_at: float = 0.0
+    started_at: float | None = None
+    finished_at: float | None = None
+    updated_at: float = 0.0
+    downloader: Downloader | None = None
+    worker: threading.Thread | None = None
+    done: threading.Event = field(default_factory=threading.Event, repr=False)
+
+
 class AppService:
     def __init__(self) -> None:
         self.config_path = Path("config.json")
@@ -73,7 +94,15 @@ class AppService:
         self.downloader: Downloader | None = None
         self._logs: deque[str] = deque(maxlen=500)
         self._worker: threading.Thread | None = None
+        self._worker_threads: set[threading.Thread] = set()
+        self._job_queue: queue.Queue[str] = queue.Queue()
+        self._jobs: dict[str, _DownloadJob] = {}
+        self._batches: dict[str, dict[str, int]] = {}
+        self._item_locks: dict[str, threading.Lock] = {}
         self._state_lock = threading.Lock()
+        self._status_condition = threading.Condition()
+        self._status_version = 0
+        self._last_progress_publish = 0.0
         # 速度/ETA 计算所需的采样历史：item_id -> [(timestamp, downloaded), ...]
         self._speed_history: dict[str, list[tuple[float, int]]] = {}
         self._download_state: dict[str, Any] = {
@@ -142,8 +171,59 @@ class AppService:
     def current_status(self) -> dict[str, Any]:
         with self._state_lock:
             state = dict(self._download_state)
-        state["worker_alive"] = bool(self._worker and self._worker.is_alive())
+            running = any(job.status == "running" for job in self._jobs.values())
+            queued = sum(job.status == "queued" for job in self._jobs.values())
+            worker_alive = any(worker.is_alive() for worker in self._worker_threads)
+        state["active"] = running
+        state["queued"] = queued
+        state["worker_alive"] = worker_alive
+        state["jobs"] = self.list_jobs()
         return state
+
+    def list_jobs(self) -> list[dict[str, Any]]:
+        with self._state_lock:
+            jobs = sorted(self._jobs.values(), key=lambda job: job.created_at)
+            return [
+                {
+                    "job_id": job.job_id,
+                    "batch_id": job.batch_id,
+                    "item_id": job.item.item_id,
+                    "item_name": job.item.name,
+                    "status": job.status,
+                    "result": job.result,
+                    "error": job.error,
+                    "created_at": job.created_at,
+                    "started_at": job.started_at,
+                    "finished_at": job.finished_at,
+                    "updated_at": job.updated_at,
+                    "override_dir": str(job.override_dir) if job.override_dir else None,
+                }
+                for job in jobs
+            ]
+
+    def _notify_status(self, force: bool = True) -> None:
+        now = time.monotonic()
+        with self._status_condition:
+            if not force and now - self._last_progress_publish < 0.25:
+                return
+            self._last_progress_publish = now
+            self._status_version += 1
+            self._status_condition.notify_all()
+
+    def status_snapshot(self) -> dict[str, Any]:
+        return {
+            "status": self.current_status(),
+            "records": self.list_downloads(),
+            "logs": self.logs(500),
+            "config": self.config_summary(),
+        }
+
+    def wait_for_status(self, last_version: int, timeout: float = 15.0) -> tuple[int, dict[str, Any]]:
+        with self._status_condition:
+            if self._status_version == last_version:
+                self._status_condition.wait(timeout=timeout)
+            version = self._status_version
+        return version, self.status_snapshot()
 
     def logs(self, limit: int = 200) -> list[str]:
         return list(self._logs)[-limit:]
@@ -253,7 +333,21 @@ class AppService:
         self.config.segments = n
         self.client.config.segments = n
         self.downloader.segments = n
+        with self._state_lock:
+            active = [job.downloader for job in self._jobs.values() if job.downloader is not None]
+        for downloader in active:
+            downloader.segments = n
         self._record_log(f"并发分段数已设置为 {n}")
+        return n
+
+    def set_download_workers(self, n: int) -> int:
+        self.ensure_ready()
+        assert self.config is not None
+        n = max(1, min(8, int(n)))
+        with self._state_lock:
+            self.config.download_workers = n
+            self._reconcile_workers_locked()
+        self._record_log(f"下载 worker 并发已设置为 {n}")
         return n
 
     def start_download(
@@ -261,42 +355,235 @@ class AppService:
         item_id: str,
         force_restart: bool = False,
         override_dir: Path | None = None,
-    ) -> None:
+    ) -> str:
         self.ensure_ready()
         assert self.client is not None
-        with self._state_lock:
-            self._ensure_idle()
-            self._worker = threading.Thread(
-                target=self._download_item_task,
-                args=(item_id, force_restart, override_dir),
-                daemon=True,
-            )
-            self._worker.start()
+        # Web 入口本来就在工作线程中执行；先展开可避免父任务占住 worker 等待子任务。
+        self.client.authenticate()
+        items = self.client.expand_download_items(item_id)
+        if not items:
+            raise RuntimeError("未找到可下载的媒体文件")
+        return self._enqueue_items(items, force_restart, override_dir)
 
-    def resume_record(self, item_id: str) -> None:
+    def resume_record(self, item_id: str) -> str:
         self.ensure_ready()
+        assert self.client is not None
+        self.client.authenticate()
+        item = self.client.get_item(item_id)
+        return self._enqueue_items([item], force_restart=False, override_dir=None)
+
+    def _enqueue_items(
+        self,
+        items: list[MediaItem],
+        force_restart: bool,
+        override_dir: Path | None,
+    ) -> str:
+        assert self.config is not None
+        if override_dir is not None:
+            override_dir.mkdir(parents=True, exist_ok=True)
+        batch_id = uuid.uuid4().hex[:12]
+        now = time.time()
+        jobs = [
+            _DownloadJob(
+                job_id=uuid.uuid4().hex[:12],
+                batch_id=batch_id,
+                item=item,
+                force_restart=force_restart,
+                override_dir=override_dir,
+                created_at=now + index * 1e-6,
+                updated_at=now,
+            )
+            for index, item in enumerate(items)
+        ]
         with self._state_lock:
-            self._ensure_idle()
-            self._worker = threading.Thread(target=self._resume_record_task, args=(item_id,), daemon=True)
-            self._worker.start()
+            busy_ids = {
+                job.item.item_id
+                for job in self._jobs.values()
+                if job.status in {"queued", "running"}
+            }
+            duplicates = [job.item.item_id for job in jobs if job.item.item_id in busy_ids]
+            if duplicates:
+                raise RuntimeError(f"资源已在下载队列中：{', '.join(duplicates)}")
+            self._batches[batch_id] = {
+                "total": len(jobs), "finished": 0, "ok": 0, "failed": 0, "skipped": 0, "cancelled": 0
+            }
+            for job in jobs:
+                self._jobs[job.job_id] = job
+                self._job_queue.put(job.job_id)
+            self._reconcile_workers_locked()
+        self._record_log(f"已加入下载队列：{len(jobs)} 个任务，worker 并发 {self.config.download_workers}")
+        if force_restart:
+            self._record_log("本批次已启用强制重下，旧断点将在各任务启动时清理")
+        return batch_id
+
+    def _reconcile_workers_locked(self) -> None:
+        assert self.config is not None
+        self._worker_threads = {worker for worker in self._worker_threads if worker.is_alive()}
+        desired = max(1, min(8, self.config.download_workers))
+        while len(self._worker_threads) < desired and not self._job_queue.empty():
+            worker = threading.Thread(target=self._queue_worker, daemon=True)
+            self._worker_threads.add(worker)
+            if self._worker is None or not self._worker.is_alive():
+                self._worker = worker
+            worker.start()
+
+    def _queue_worker(self) -> None:
+        current = threading.current_thread()
+        while True:
+            with self._state_lock:
+                assert self.config is not None
+                if len(self._worker_threads) > self.config.download_workers:
+                    self._worker_threads.discard(current)
+                    self._notify_status()
+                    return
+            try:
+                job_id = self._job_queue.get_nowait()
+            except queue.Empty:
+                with self._state_lock:
+                    self._worker_threads.discard(current)
+                self._notify_status()
+                return
+            try:
+                with self._state_lock:
+                    job = self._jobs[job_id]
+                    if job.status == "cancelled":
+                        continue
+                    job.status = "running"
+                    job.started_at = time.time()
+                    job.updated_at = job.started_at
+                    job.worker = current
+                self._notify_status()
+                self._run_job(job)
+            finally:
+                self._job_queue.task_done()
+
+    def _run_job(self, job: _DownloadJob) -> None:
+        assert self.config is not None and self.library is not None
+        job_config = replace(self.config)
+        if job.override_dir is not None:
+            job_config.download_dir = job.override_dir
+        client = EmbyClient(job_config)
+        downloader = Downloader(
+            client,
+            self.library,
+            progress_callback=lambda status, item, downloaded, expected, path, detail: self._download_progress_for_job(
+                job.job_id, status, item, downloaded, expected, path, detail
+            ),
+            segments=job_config.segments,
+        )
+        with self._state_lock:
+            job.downloader = downloader
+        try:
+            client.authenticate()
+            with self._state_lock:
+                item_lock = self._item_locks.setdefault(job.item.item_id, threading.Lock())
+            with item_lock:
+                path = downloader.download_item(job.item, force_restart=job.force_restart)
+            result = downloader.last_result_status or "completed"
+            with self._state_lock:
+                job.status = "completed"
+                job.result = result
+            if result == "skipped":
+                self._record_log(f"文件已存在，跳过：{job.item.name}")
+            else:
+                self._record_log(f"已保存：{path}")
+        except DownloadCancelled:
+            with self._state_lock:
+                job.status = "cancelled"
+                job.result = "cancelled"
+            self._record_log(f"已取消：{job.item.name}")
+        except (DownloadError, EmbyClientError, OSError) as exc:
+            with self._state_lock:
+                job.status = "failed"
+                job.result = "failed"
+                job.error = str(exc)
+            self._record_log(f"下载失败：{job.item.name}（{exc}）")
+        except Exception as exc:
+            with self._state_lock:
+                job.status = "failed"
+                job.result = "failed"
+                job.error = str(exc)
+            logger.exception("后台下载任务异常：%s", job.item.name)
+            self._record_log(f"后台任务异常：{job.item.name}（{exc}）")
+        finally:
+            client.close()
+            with self._state_lock:
+                job.downloader = None
+                job.finished_at = time.time()
+                job.updated_at = job.finished_at
+            self._finish_job(job)
+            job.done.set()
+            self._notify_status()
+
+    def _download_progress_for_job(self, job_id: str, *args: Any) -> None:
+        with self._state_lock:
+            job = self._jobs.get(job_id)
+            if job is not None:
+                job.updated_at = time.time()
+        self._download_progress(*args)
+
+    def _finish_job(self, job: _DownloadJob) -> None:
+        summary = None
+        with self._state_lock:
+            batch = self._batches.get(job.batch_id)
+            if batch is None or job.result is None:
+                return
+            batch["finished"] += 1
+            result_key = "ok" if job.result == "completed" else job.result
+            if result_key in {"ok", "failed", "skipped", "cancelled"}:
+                batch[result_key] += 1
+            if batch["finished"] == batch["total"]:
+                summary = dict(batch)
+        if summary is not None:
+            self._record_log(
+                f"批量下载完成：成功 {summary['ok']} / 失败 {summary['failed']} / "
+                f"跳过 {summary['skipped']} / 取消 {summary['cancelled']}，共 {summary['total']} 项"
+            )
 
     def pause_current(self) -> None:
         self.ensure_ready()
-        assert self.downloader is not None
-        self.downloader.pause()
-        self._record_log("已请求暂停当前下载")
+        with self._state_lock:
+            targets = [
+                job.downloader for job in self._jobs.values()
+                if job.status == "running" and job.downloader is not None
+            ]
+        for downloader in targets:
+            downloader.pause()
+        self._record_log(f"已请求暂停 {len(targets)} 个运行中的下载")
 
     def resume_current(self) -> None:
         self.ensure_ready()
-        assert self.downloader is not None
-        self.downloader.resume()
-        self._record_log("已请求继续当前下载")
+        with self._state_lock:
+            targets = [
+                job.downloader for job in self._jobs.values()
+                if job.status == "running" and job.downloader is not None
+            ]
+        for downloader in targets:
+            downloader.resume()
+        self._record_log(f"已请求继续 {len(targets)} 个运行中的下载")
 
     def cancel_current(self, cleanup_temp: bool = False) -> None:
         self.ensure_ready()
-        assert self.downloader is not None
-        self.downloader.cancel(cleanup_temp=cleanup_temp)
-        self._record_log(f"已请求取消当前下载（cleanup_temp={cleanup_temp}）")
+        cancelled_queued: list[_DownloadJob] = []
+        with self._state_lock:
+            targets = []
+            for job in self._jobs.values():
+                if job.status == "queued":
+                    job.status = "cancelled"
+                    job.result = "cancelled"
+                    job.finished_at = time.time()
+                    cancelled_queued.append(job)
+                elif job.status == "running" and job.downloader is not None:
+                    targets.append(job.downloader)
+        for job in cancelled_queued:
+            self._finish_job(job)
+            job.done.set()
+        for downloader in targets:
+            downloader.cancel(cleanup_temp=cleanup_temp)
+        self._record_log(
+            f"已请求取消 {len(targets)} 个运行中下载，并取消 {len(cancelled_queued)} 个排队任务"
+            f"（cleanup_temp={cleanup_temp}）"
+        )
 
     def delete_record(self, item_id: str) -> dict[str, Any]:
         self.ensure_ready()
@@ -304,13 +591,38 @@ class AppService:
         record = self.library.get(item_id)
         if not record:
             raise RuntimeError("Record not found")
-        # N15：删除进行中记录前先取消任务并等待 worker 退出，避免记录复活/文件占用
+        # N15：只等待目标任务完成，不因 worker 继续处理其他条目而误删或误报。
         with self._state_lock:
+            matching_jobs = [
+                job for job in self._jobs.values()
+                if job.item.item_id == item_id and job.status in {"queued", "running"}
+            ]
+            queued_jobs = []
+            running_jobs = []
+            for job in matching_jobs:
+                if job.status == "queued":
+                    job.status = "cancelled"
+                    job.result = "cancelled"
+                    job.finished_at = time.time()
+                    queued_jobs.append(job)
+                elif job.status == "running":
+                    running_jobs.append(job)
             active_id = self._download_state.get("item_id")
             worker = self._worker
-        if active_id == item_id and worker and worker.is_alive():
+        for job in queued_jobs:
+            self._finish_job(job)
+            job.done.set()
+        for job in running_jobs:
+            if job.downloader is not None:
+                job.downloader.cancel(cleanup_temp=True)
+        for job in running_jobs:
+            if not job.done.wait(timeout=15):
+                raise RuntimeError("下载任务尚未停止，已保留文件和记录，请稍后重试")
+        if not matching_jobs and active_id == item_id and worker and worker.is_alive():
             self.downloader.cancel(cleanup_temp=True)
             worker.join(timeout=15)
+            if worker.is_alive():
+                raise RuntimeError("下载任务尚未停止，已保留文件和记录，请稍后重试")
         path = Path(record.target_path)
         removed_file = False
         if path.exists():
@@ -318,6 +630,9 @@ class AppService:
             removed_file = True
         temp_path = path.with_name(path.name + ".part")
         temp_path.unlink(missing_ok=True)
+        meta_path = temp_path.with_name(temp_path.name + ".meta.json")
+        meta_path.unlink(missing_ok=True)
+        meta_path.with_name(meta_path.name + ".tmp").unlink(missing_ok=True)
         # N9：iterdir+startswith 替代 glob，兼容 [ ] 等元字符标题
         seg_prefix = temp_path.name + ".seg"
         if temp_path.parent.exists():
@@ -381,79 +696,20 @@ class AppService:
     def config_summary(self) -> dict[str, Any]:
         self.ensure_ready()
         assert self.config is not None
+        with self._state_lock:
+            worker_alive = any(worker.is_alive() for worker in self._worker_threads)
         return {
             "server_url": self.config.server_url,
             "download_dir": str(self.config.download_dir),
             "segments": self.config.segments,
+            "download_workers": self.config.download_workers,
             "stream_segments": self.config.stream_segments,
             "config_path": str(self.config_path),
             "proxy_http": self.config.proxy_http,
             "proxy_https": self.config.proxy_https,
             "experimental_force_multipart": self.config.experimental_force_multipart,
-            "worker_alive": bool(self._worker and self._worker.is_alive()),
+            "worker_alive": worker_alive,
         }
-
-    def _ensure_idle(self) -> None:
-        if self._worker and self._worker.is_alive():
-            raise RuntimeError("A download task is already running")
-
-    def _download_item_task(self, item_id: str, force_restart: bool, override_dir: Path | None) -> None:
-        assert self.client is not None and self.downloader is not None
-        original_download_dir = self.client.config.download_dir
-        try:
-            if override_dir is not None:
-                override_dir.mkdir(parents=True, exist_ok=True)
-                self.client.config.download_dir = override_dir
-                self.downloader.client.config.download_dir = override_dir
-                self._record_log(f"本次下载目录：{override_dir}")
-            self.client.authenticate()
-            items = self.client.expand_download_items(item_id)
-            if items:
-                self._record_log(f"准备下载 {len(items)} 个条目：{items[0].name}")
-            if force_restart:
-                self._record_log("已启用忽略 .part 重新开始")
-            ok = failed = skipped = 0
-            for item in items:
-                try:
-                    path = self.downloader.download_item(item, force_restart=force_restart)
-                    if self.downloader.last_result_status == "skipped":
-                        skipped += 1
-                        self._record_log(f"已存在，跳过下载：{path}")
-                    else:
-                        ok += 1
-                        self._record_log(f"已保存：{path}")
-                except DownloadCancelled:
-                    self._record_log(f"已取消：{item.name}")
-                    break
-                except (DownloadError, EmbyClientError, OSError) as exc:
-                    failed += 1
-                    self._record_log(f"单集失败，继续下一集：{item.name}（{exc}）")
-                    continue
-            self._record_log(f"批量下载结束：成功 {ok} / 失败 {failed} / 跳过 {skipped}")
-        except Exception as exc:
-            self._mark_failed(str(exc))
-            self._record_log(f"下载任务失败：{exc}")
-        finally:
-            self.client.config.download_dir = original_download_dir
-            self.downloader.client.config.download_dir = original_download_dir
-
-    def _resume_record_task(self, item_id: str) -> None:
-        assert self.client is not None and self.downloader is not None
-        try:
-            self.client.authenticate()
-            item = self.client.get_item(item_id)
-            self._record_log(f"从下载记录继续：{item.name}")
-            try:
-                path = self.downloader.download_item(item)
-                if self.downloader.last_result_status == "skipped":
-                    self._record_log(f"已存在，跳过下载：{path}")
-                else:
-                    self._record_log(f"已保存：{path}")
-            except DownloadCancelled:
-                self._record_log(f"已取消：{item.name}")
-        except Exception as exc:
-            self._mark_failed(str(exc))
-            self._record_log(f"继续下载失败：{exc}")
 
     def _download_progress(
         self,
@@ -584,12 +840,14 @@ class AppService:
             # fallback / candidate_failed / diagnostic / 其它：保持默认占位
             state.setdefault("speed_text", "--")
             state.setdefault("eta_text", "--")
+        self._notify_status(force=status != "progress")
 
     def _record_log(self, message: str) -> None:
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         line = f"{timestamp} {message}"
         self._logs.append(line)
         logger.info("[service] %s", message)
+        self._notify_status()
 
     def _mark_failed(self, detail: str) -> None:
         with self._state_lock:
