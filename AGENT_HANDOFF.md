@@ -68,18 +68,18 @@ Set-Location "C:\Users\Lenovo\Downloads\emby-cache-tool"
 ```powershell
 Set-Location "C:\Users\Lenovo\Downloads\emby-cache-tool"
 py -3.12 -m venv .venv
-& ".\.venv\Scripts\python.exe" -m pip install -r requirements.txt pytest httpx
+& ".\.venv\Scripts\python.exe" -m pip install -r requirements.txt pytest httpx2 httpx
 ```
 
 ## 3. 已验证结果
 
-本机 Windows 实机已运行完整测试：
+本机 Windows 实机已运行完整测试（2026-11-19 更新，HEAD 详见 Git log）：
 
 ```text
-84 passed, 1 warning in 57.79s
+104 passed in 71.83s（历史基线：84 passed, 1 warning in 57.79s）
 ```
 
-唯一警告：`tests/test_sse.py` 中 Starlette TestClient/httpx 的弃用提示。它不是功能失败，不要通过删除测试、吞掉警告或放宽断言来“修复”。
+曾有的唯一警告（Starlette TestClient/httpx 弃用提示）已通过安装 httpx2 消除（见 §8 P3）；不要通过删除测试、吞掉警告或放宽断言来“修复”任何回归。
 
 云端还曾验证：
 
@@ -217,6 +217,7 @@ py -3.12 -m venv .venv
 ### P2：持久任务队列（只有用户需要时）
 
 先设计数据库系统记录源、启动对账、重复入队、取消、崩溃恢复、批次状态与旧版本兼容，再编码。不要简单把当前内存队列序列化就宣称可靠恢复。
+入队判重（DupeCheck，2026-11-19 已实现一部分）：历史中已 completed 的条目入队时直接跳过并入队响应显式报告（`queued/skipped_completed/batch_id`）；`force_restart` 语义优先；全部已缓存时不创建空批次。回归 `tests/test_enqueue_dedupe.py`。此改动源自 Sonarr/SABnzbd/NZBGet 竞品调研；调研还识别出「事件型历史、统一通知钩子、外挂字幕随行、缓存容量滚动清理、磁盘空间护栏」等待选特性，详见聊天记录或按需重调研。
 
 ### P2：真实 GUI/Web 交互验收
 
@@ -224,7 +225,7 @@ py -3.12 -m venv .venv
 
 ### P3：测试依赖与日志维护
 
-处理 Starlette TestClient/httpx 弃用提示时，以真实兼容契约为准；日志 i18n 可单独做，避免与可靠性改动混成难以审查的大提交。
+Starlette TestClient/httpx2 弃用提示已于 2026-11-19 处理：安装 `httpx2`（2.16.2）并加入 pyproject `dev` extras，测试代码零改动，全套警告清零（官方路线，FastAPI 同款做法；httpx 保留在 dev 里兼容旧环境）。调研结论：httpx 自 2024-12 后停止维护，httpx2 是 Pydantic 接管的官方续作（fork 自 0.28.1、API 相同）；注意其 SSL 改用 truststore，若部署环境有私有自签 CA 需验证。日志 i18n 仍未做，避免与可靠性改动混成大提交。
 
 ## 9. 下一位 Agent 的执行约定
 

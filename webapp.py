@@ -467,11 +467,19 @@ async function startDownload(itemId) {
   const overrideDir = document.getElementById('overrideDir').value.trim();
   const forceRestart = document.getElementById('forceRestart').checked;
   try {
-    await api('/api/download', {
+    const data = await api('/api/download', {
       method:'POST',
       body: JSON.stringify({item_id:itemId, force_restart:forceRestart, override_dir: overrideDir || null})
     });
-    document.getElementById('status').textContent = '下载任务已启动';
+    // 入队判重结果显式反馈：queued=实际入队数，skipped_completed=已缓存直接跳过的条目
+    const skipped = data.skipped_completed || [];
+    if (data.queued === 0) {
+      document.getElementById('status').textContent = `均已缓存完成，无需下载（${skipped.length} 项）`;
+    } else if (skipped.length > 0) {
+      document.getElementById('status').textContent = `已入队 ${data.queued} 项；${skipped.length} 项已缓存跳过`;
+    } else {
+      document.getElementById('status').textContent = '下载任务已启动';
+    }
   } catch (e) {
     document.getElementById('status').textContent = e.message || e;
   }
@@ -886,6 +894,9 @@ async def _json_body(request: Request) -> dict[str, Any]:
 
 
 def _ok(_value: Any = None) -> dict[str, Any]:
+    # dict 返回值（如入队判重结果）透传给前端；其余维持 {"ok": True} 兼容旧行为
+    if isinstance(_value, dict):
+        return {"ok": True, **_value}
     return {"ok": True}
 
 

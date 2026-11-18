@@ -16,7 +16,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "httpx>=0.27"]
+# httpx2：Starlette 1.2+ TestClient 的官方推荐依赖（httpx 已停止维护）；
+# 测试代码零改动，安装后 StarletteDeprecationWarning 消除。保留 httpx 以兼容旧环境。
+dev = ["pytest>=8", "httpx2>=2.0", "httpx>=0.27"]
 
 [project.scripts]
 emby-archiver = "main:main"

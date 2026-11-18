@@ -359,7 +359,7 @@ class AppService:
         item_id: str,
         force_restart: bool = False,
         override_dir: Path | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         self.ensure_ready()
         assert self.client is not None
         # Web 入口本来就在工作线程中执行；先展开可避免父任务占住 worker 等待子任务。
@@ -369,7 +369,7 @@ class AppService:
             raise RuntimeError("未找到可下载的媒体文件")
         return self._enqueue_items(items, force_restart, override_dir)
 
-    def resume_record(self, item_id: str) -> str:
+    def resume_record(self, item_id: str) -> dict[str, Any]:
         self.ensure_ready()
         assert self.client is not None
         self.client.authenticate()
@@ -381,10 +381,32 @@ class AppService:
         items: list[MediaItem],
         force_restart: bool,
         override_dir: Path | None,
-    ) -> str:
-        assert self.config is not None
+    ) -> dict[str, Any]:
+        assert self.config is not None and self.library is not None
         if override_dir is not None:
             override_dir.mkdir(parents=True, exist_ok=True)
+        # DupeCheck：判重键用天然稳定的 Emby item_id。历史中已 completed 的条目
+        # 不再入队（force_restart 语义优先，强制重下照常入队）。
+        skipped_completed: list[str] = []
+        pending_items = items
+        if not force_restart:
+            skipped_completed = [
+                item.item_id for item in items
+                if (rec := self.library.get(item.item_id)) is not None and rec.status == "completed"
+            ]
+            if skipped_completed:
+                done_ids = set(skipped_completed)
+                pending_items = [item for item in items if item.item_id not in done_ids]
+                self._record_log(
+                    f"已缓存完成、本次跳过 {len(skipped_completed)} 项：{', '.join(skipped_completed)}"
+                )
+                if not pending_items:
+                    return {
+                        "batch_id": None,
+                        "total": len(items),
+                        "queued": 0,
+                        "skipped_completed": skipped_completed,
+                    }
         batch_id = uuid.uuid4().hex[:12]
         now = time.time()
         jobs = [
@@ -397,7 +419,7 @@ class AppService:
                 created_at=now + index * 1e-6,
                 updated_at=now,
             )
-            for index, item in enumerate(items)
+            for index, item in enumerate(pending_items)
         ]
         with self._state_lock:
             busy_ids = {
@@ -419,7 +441,12 @@ class AppService:
         self._record_log(f"已加入下载队列：{len(jobs)} 个任务，worker 并发 {self.config.download_workers}")
         if force_restart:
             self._record_log("本批次已启用强制重下，旧断点将在各任务启动时清理")
-        return batch_id
+        return {
+            "batch_id": batch_id,
+            "total": len(items),
+            "queued": len(jobs),
+            "skipped_completed": skipped_completed,
+        }
 
     def _reconcile_workers_locked(self) -> None:
         assert self.config is not None
